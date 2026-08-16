@@ -1,6 +1,6 @@
 // Unit tests for the StarryVector core (M0 scope).
 //
-// Uses doctest (vendored single header, C++11 compatible).  The most
+// Uses doctest (vendored single header).  The most
 // important test pattern here is the "oracle comparison": search results
 // are validated against a naive reference implementation (compute all
 // distances, sort everything, take the first k).  Every future index

@@ -1,14 +1,12 @@
 # StarryVector top-level build script.
 #
-# Language policy: strict C++11 everywhere.  CI (and local builds) must
-# never need a newer standard; please keep it that way (see
-# notes/01-项目组成.md, "C++11 检查单").
+# Language policy: C++17 everywhere.
 cmake_minimum_required(VERSION 3.10)
 project(StarryVector LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)  # -std=c++11, not gnu++11
+set(CMAKE_CXX_EXTENSIONS OFF)  # -std=c++17, not gnu++17
 
 add_compile_options(-Wall -Wextra -pedantic)
 
