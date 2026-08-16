@@ -10,9 +10,7 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)  # -std=c++11, not gnu++11
 
-if(NOT MSVC)
-  add_compile_options(-Wall -Wextra -pedantic)
-endif()
+add_compile_options(-Wall -Wextra -pedantic)
 
 # Keep every produced binary under build/bin for easy scripting.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
