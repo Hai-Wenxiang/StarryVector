@@ -19,6 +19,7 @@
 #include "starry/db.hpp"
 #include "starry/distance.hpp"
 #include "starry/flat_index.hpp"
+#include "starry/hnsw_index.hpp"
 
 namespace {
 
@@ -266,6 +267,121 @@ TEST_CASE("empty database search returns nothing") {
   const std::vector<float> q(3, 0.5f);
   CHECK(db.search(q, 5).empty());
   CHECK(db.search(q, 5).empty());
+}
+
+// ---- HNSW ---------------------------------------------------------------------
+
+TEST_CASE("hnsw search reaches >=0.95 recall@10 against the flat oracle") {
+  const std::size_t dim = 32;
+  const std::size_t rows = 3000;
+  const std::size_t k = 10;
+
+  std::vector<float> data = make_random_vector(rows * dim, 21);
+  starry::VectorDB flat(dim, starry::kL2, starry::kFlatIndex);
+  starry::VectorDB hnsw(dim, starry::kL2, starry::kHnswIndex);
+  hnsw.set_search_ef(128);
+  for (std::size_t i = 0; i < rows; ++i) {
+    const float* v = &data[i * dim];
+    REQUIRE(flat.insert(i, v) == starry::kOk);
+    REQUIRE(hnsw.insert(i, v) == starry::kOk);
+  }
+
+  double hits = 0.0;
+  double total = 0.0;
+  for (std::uint32_t q = 0; q < 30; ++q) {
+    const std::vector<float> query = make_random_vector(dim, 1000 + q);
+    const std::vector<starry::SearchResult> want =
+        flat.search(&query[0], k);
+    const std::vector<starry::SearchResult> got = hnsw.search(&query[0], k);
+    REQUIRE(got.size() == k);
+    std::unordered_set<starry::id_t> want_ids;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      want_ids.insert(want[i].id);
+    }
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      if (want_ids.count(got[i].id) != 0) {
+        hits += 1.0;
+      }
+      // Reported distances must match the exact ones for shared ids
+      // (same kernel, same vectors).
+      for (std::size_t j = 0; j < want.size(); ++j) {
+        if (want[j].id == got[i].id) {
+          CHECK(std::fabs(want[j].distance - got[i].distance) < 1e-3f);
+        }
+      }
+    }
+    total += static_cast<double>(k);
+  }
+  CHECK(hits / total >= 0.95);
+}
+
+TEST_CASE("hnsw honours tombstones and save/load round-trips the graph") {
+  const std::size_t dim = 16;
+  const std::size_t rows = 500;
+  std::vector<float> data = make_random_vector(rows * dim, 33);
+  starry::VectorDB hnsw(dim, starry::kL2, starry::kHnswIndex);
+  hnsw.set_search_ef(96);
+  for (std::size_t i = 0; i < rows; ++i) {
+    REQUIRE(hnsw.insert(static_cast<starry::id_t>(i), &data[i * dim]) ==
+            starry::kOk);
+  }
+  // Delete a band of ids; deleted rows must never surface.
+  for (std::size_t i = 0; i < rows; i += 3) {
+    REQUIRE(hnsw.remove(static_cast<starry::id_t>(i)) == starry::kOk);
+  }
+  const std::vector<float> query = make_random_vector(dim, 77);
+  const std::vector<starry::SearchResult> after_del =
+      hnsw.search(&query[0], 50);
+  for (std::size_t i = 0; i < after_del.size(); ++i) {
+    CHECK(after_del[i].id % 3 != 0);
+  }
+
+  const char* path = "/tmp/starry_test_hnsw.bin";
+  REQUIRE(hnsw.save(path) == starry::kOk);
+  starry::Status status = starry::kOk;
+  std::unique_ptr<starry::VectorDB> loaded = starry::VectorDB::load(path, &status);
+  REQUIRE(loaded);
+  CHECK(status == starry::kOk);
+  CHECK(loaded->kind() == starry::kHnswIndex);
+  loaded->set_search_ef(96);
+  const std::vector<starry::SearchResult> after_load =
+      loaded->search(&query[0], 50);
+  CHECK(same_hits(after_del, after_load));  // graph restored bit-identically
+  std::remove(path);
+}
+
+TEST_CASE("flat databases still load from a V1 file (back-compat)") {
+  // A hand-rolled minimal STARRYV1 file with 2 rows of dim 2 (L2).
+  const char* path = "/tmp/starry_test_v1.bin";
+  FILE* f = std::fopen(path, "wb");
+  REQUIRE(f != 0);
+  const char magic[8] = {'S', 'T', 'A', 'R', 'R', 'Y', 'V', '1'};
+  std::fwrite(magic, 1, 8, f);
+  std::uint32_t metric = 0, pad = 0;  // l2, zero padding = flat kind
+  std::fwrite(&metric, 4, 1, f);
+  std::fwrite(&pad, 4, 1, f);
+  std::uint64_t d = 2, n = 2;
+  std::fwrite(&d, 8, 1, f);
+  std::fwrite(&n, 8, 1, f);
+  const float vecs[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+  std::fwrite(vecs, 4, 4, f);
+  const std::uint64_t ids[2] = {7, 9};
+  std::fwrite(ids, 8, 2, f);
+  const std::uint64_t del = 0;
+  std::fwrite(&del, 8, 1, f);
+  std::fclose(f);
+
+  starry::Status status = starry::kOk;
+  std::unique_ptr<starry::VectorDB> db = starry::VectorDB::load(path, &status);
+  REQUIRE(db);
+  CHECK(status == starry::kOk);
+  CHECK(db->kind() == starry::kFlatIndex);
+  CHECK(db->size() == 2);
+  const float q[] = {0.9f, 0.9f};
+  const std::vector<starry::SearchResult> hits = db->search(q, 1);
+  REQUIRE(hits.size() == 1);
+  CHECK(hits[0].id == 9);
+  std::remove(path);
 }
 
 // ---- persistence ---------------------------------------------------------------

@@ -35,6 +35,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "starry/db.hpp"
@@ -78,28 +79,34 @@ struct Config {
   std::size_t queries = 200;
   std::size_t threads = 1;
   std::uint32_t seed = 42;
+  std::string index = "flat";  // flat | hnsw
+  std::size_t ef = 0;          // 0 -> library default
 };
 
 bool parse_args(int argc, char** argv, Config* cfg) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const bool has_value = (i + 1 < argc);
-    if (!has_value) {
+    if (arg == "--index" || arg == "--ef") {
+      // flags with values, validated below
+    } else if (!has_value) {
       std::cerr << "missing value for " << arg << "\n";
       return false;
     }
-    const char* val = argv[++i];
+    const char* val = has_value ? argv[++i] : "";
     if (arg == "--dim") cfg->dim = std::strtoul(val, 0, 10);
     else if (arg == "--n") cfg->n = std::strtoul(val, 0, 10);
     else if (arg == "--k") cfg->k = std::strtoul(val, 0, 10);
     else if (arg == "--queries") cfg->queries = std::strtoul(val, 0, 10);
     else if (arg == "--threads") cfg->threads = std::strtoul(val, 0, 10);
     else if (arg == "--seed") cfg->seed = static_cast<std::uint32_t>(std::strtoul(val, 0, 10));
+    else if (arg == "--index") cfg->index = val;
+    else if (arg == "--ef") cfg->ef = std::strtoul(val, 0, 10);
     else if (arg == "--metric") { if (!starry::parse_metric(val, &cfg->metric)) { std::cerr << "unknown metric: " << val << "\n"; return false; } }
     else { std::cerr << "unknown flag: " << arg << "\n"; return false; }
   }
   return cfg->dim > 0 && cfg->n > 0 && cfg->k > 0 && cfg->queries > 0 &&
-         cfg->threads > 0;
+         cfg->threads > 0 && (cfg->index == "flat" || cfg->index == "hnsw");
 }
 
 }  // namespace
@@ -120,10 +127,14 @@ int main(int argc, char** argv) {
   std::mt19937 rng(cfg.seed);
   std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
 
-  starry::VectorDB db(cfg.dim, cfg.metric);
+  const starry::IndexKind kind = cfg.index == "hnsw"
+      ? starry::kHnswIndex : starry::kFlatIndex;
+  starry::VectorDB db(cfg.dim, cfg.metric, kind);
+  db.set_search_ef(cfg.ef);
 
   // -- build phase ---------------------------------------------------------
-  std::cerr << "[bench] building index: n=" << cfg.n << " dim=" << cfg.dim
+  std::cerr << "[bench] building " << cfg.index
+            << " index: n=" << cfg.n << " dim=" << cfg.dim
             << " metric=" << starry::metric_name(cfg.metric) << "\n";
   std::vector<float> buf(cfg.dim);
   const Clock::time_point build_t0 = Clock::now();
@@ -143,6 +154,42 @@ int main(int argc, char** argv) {
   std::vector<float> queries(cfg.queries * cfg.dim);
   for (std::size_t i = 0; i < queries.size(); ++i) {
     queries[i] = uniform(rng);
+  }
+
+  // Ground truth for recall: an independent exact FlatIndex scan (also
+  // the fairness oracle - hnsw numbers below are meaningless without it).
+  double recall = 1.0;
+  if (kind == starry::kHnswIndex) {
+    std::cerr << "[bench] computing exact ground truth for recall...\n";
+    starry::FlatIndex truth(cfg.dim, cfg.metric);
+    std::vector<float> data(cfg.n * cfg.dim);
+    // Re-generate the dataset deterministically (same seed, same order).
+    std::mt19937 rng2(cfg.seed);
+    for (std::size_t i = 0; i < cfg.n * cfg.dim; ++i) {
+      data[i] = uniform(rng2);
+    }
+    for (std::size_t i = 0; i < cfg.n; ++i) {
+      truth.add(static_cast<starry::id_t>(i), &data[i * cfg.dim]);
+    }
+    double hits = 0.0;
+    double total = 0.0;
+    for (std::size_t q = 0; q < cfg.queries; ++q) {
+      const std::vector<starry::SearchResult> want =
+          truth.search(&queries[q * cfg.dim], cfg.k, 0);
+      const std::vector<starry::SearchResult> got =
+          db.search(&queries[q * cfg.dim], cfg.k);
+      std::unordered_set<starry::id_t> want_ids;
+      for (std::size_t i = 0; i < want.size(); ++i) {
+        want_ids.insert(want[i].id);
+      }
+      for (std::size_t i = 0; i < got.size(); ++i) {
+        if (want_ids.count(got[i].id) != 0) {
+          hits += 1.0;
+        }
+      }
+      total += static_cast<double>(cfg.k);
+    }
+    recall = total > 0.0 ? hits / total : 0.0;
   }
 
   // -- warm up caches/JIT-free code paths with a few discarded queries ----
@@ -210,7 +257,9 @@ int main(int argc, char** argv) {
   std::cout << "    \"metric\": \"" << starry::metric_name(cfg.metric) << "\",\n";
   std::cout << "    \"queries\": " << cfg.queries << ",\n";
   std::cout << "    \"threads\": " << cfg.threads << ",\n";
-  std::cout << "    \"seed\": " << cfg.seed << "\n";
+  std::cout << "    \"seed\": " << cfg.seed << ",\n";
+  std::cout << "    \"index\": \"" << cfg.index << "\",\n";
+  std::cout << "    \"ef\": " << db.search_ef() << "\n";
   std::cout << "  },\n";
   std::cout << "  \"build\": {\n";
   std::cout << json_num("seconds", build_s) << ",\n";
@@ -232,7 +281,12 @@ int main(int argc, char** argv) {
   std::cout << "    \"vectors\": " << db.size() << ",\n";
   std::cout << "    \"row_bytes\": " << (cfg.dim * 4 + 8) << "\n";
   std::cout << "  },\n";
-  std::cout << "  \"exact\": true\n";
+  if (kind == starry::kHnswIndex) {
+    std::cout << json_num("recall_at_k", recall) << ",\n";
+    std::cout << "  \"exact\": false\n";
+  } else {
+    std::cout << "  \"exact\": true\n";
+  }
   std::cout << "}\n";
   return 0;
 }

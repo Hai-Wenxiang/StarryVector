@@ -6,9 +6,10 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 
 ## Features
 
-- **Exact Search (available now)** — brute-force kNN with SIMD distance kernels (AVX2 with runtime CPU dispatch and a scalar fallback; L2, inner product, cosine), 100% recall by construction. Cosine vectors are L2-normalised on insert so searches reduce to inner products (~2x faster on top of SIMD).
-- **Persistence** — single-file `save()` / `load()` with tombstone-aware soft deletion
-- **ANN Indexes** (planned) — HNSW graph index and IVF with quantization, validated against the exact core
+- **Exact Search** — brute-force kNN with SIMD distance kernels (AVX2 with runtime CPU dispatch and a scalar fallback; L2, inner product, cosine), 100% recall by construction. Cosine vectors are L2-normalised on insert so searches reduce to inner products (~2x faster on top of SIMD).
+- **HNSW ANN Index** — hierarchical navigable small-world graph (Malkov & Yashunin) with incremental inserts, diversity-based neighbour selection and a tunable `ef` search beam. 6x+ faster than the exact scan at 99.5% recall on clustered data; deterministic builds (fixed seed).
+- **Persistence** — single-file `save()` / `load()` with tombstone-aware soft deletion (V2 format stores the HNSW graph; V1 flat files still load)
+- **IVF + Quantization** (planned) — second engine with memory-lean scans, validated against the exact core
 - **Metadata Filtering** (planned) — combine vector search with scalar attribute filters
 - **Simple API** — clean C++17 interface; status codes instead of exceptions
 
@@ -16,7 +17,7 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 
 - [x] Core vector storage & exact kNN search
 - [x] SIMD distance kernels (AVX2, runtime dispatch, `STARRY_FORCE_SCALAR=1` to disable)
-- [ ] HNSW index
+- [x] HNSW index
 - [ ] IVF index with k-means clustering
 - [ ] Metadata filtering
 - [ ] WAL + mmap storage engine

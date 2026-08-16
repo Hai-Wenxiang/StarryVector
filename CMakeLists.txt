@@ -26,6 +26,7 @@ add_library(starry_core STATIC
   src/types.cpp
   src/distance.cpp
   src/flat_index.cpp
+  src/hnsw_index.cpp
   src/db.cpp)
 
 option(STARRY_DISABLE_SIMD "Do not build SIMD kernels (scalar only)" OFF)

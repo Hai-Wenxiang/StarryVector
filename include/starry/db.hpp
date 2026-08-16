@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "starry/flat_index.hpp"
+#include "starry/hnsw_index.hpp"
 #include "starry/types.hpp"
 
 namespace starry {
@@ -42,11 +43,22 @@ enum Status {
   kIoError = 4,          // file could not be opened / read / written
 };
 
+// Which index backs search().  kFlat is exact brute force; kHnsw keeps a
+// FlatIndex for storage/ground truth plus an HNSW graph for approximate
+// search (recall tunable via the ef search parameter).
+enum IndexKind {
+  kFlatIndex = 0,
+  kHnswIndex = 1,
+};
+
 class VectorDB {
  public:
   // Creates an empty database for `dim`-dimensional vectors compared
-  // with `metric` (default: squared Euclidean).
-  explicit VectorDB(std::size_t dim, Metric metric = kL2);
+  // with `metric` (default: squared Euclidean).  With kind == kHnswIndex
+  // the database maintains an HNSW graph (M=16, ef_construction=200,
+  // fixed seed => reproducible builds) on top of the flat storage.
+  explicit VectorDB(std::size_t dim, Metric metric = kL2,
+                    IndexKind kind = kFlatIndex);
 
   // ---- write path ----------------------------------------------------
 
@@ -64,11 +76,20 @@ class VectorDB {
 
   // ---- read path -----------------------------------------------------
 
-  // Exact k-NN search over all live (non-deleted) vectors.  Returns at
-  // most k hits sorted by ascending distance.
+  // k-NN search over all live (non-deleted) vectors.  With kFlatIndex
+  // this is exact; with kHnswIndex it is approximate (see set_search_ef).
+  // Returns at most k hits sorted by ascending distance.
   std::vector<SearchResult> search(const float* query, std::size_t k) const;
   std::vector<SearchResult> search(const std::vector<float>& query,
                                    std::size_t k) const;
+
+  // Beam width of HNSW searches (ignored by kFlatIndex).  0 selects the
+  // default (64).  Larger values trade speed for recall.
+  void set_search_ef(std::size_t ef);
+  std::size_t search_ef() const;
+
+  // Index kind this database was created with.
+  IndexKind kind() const { return kind_; }
 
   // Copies the stored vector for `id` into *out.  Returns false when the
   // id is unknown or deleted.  Note: with the cosine metric the stored
@@ -101,7 +122,15 @@ class VectorDB {
  private:
   const std::size_t dim_;
   const Metric metric_;
-  FlatIndex index_;  // raw storage + brute-force search
+  IndexKind kind_;  // logically const after construction; load() flips it
+                    // from flat to hnsw after restoring the saved graph
+  FlatIndex index_;  // raw storage + brute-force search (ground truth)
+
+  // Present only when kind_ == kHnswIndex.  Null during load(): rows are
+  // restored into the flat storage first, then the saved graph is
+  // deserialized on top (avoids rebuilding it row by row).
+  std::unique_ptr<HnswIndex> hnsw_;
+  std::size_t ef_ = 0;  // 0 -> HnswIndex::default_ef()
 
   // Live id -> row in index_.  Deleted ids are erased from here and put
   // into deleted_ instead; the row stays in the index buffer.

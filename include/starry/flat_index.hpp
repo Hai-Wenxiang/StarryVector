@@ -49,6 +49,10 @@ class FlatIndex {
   // Vector dimensionality.
   std::size_t dim() const { return dim_; }
 
+  // Comparison metric of this index (needed by indexes layered on top,
+  // e.g. HnswIndex, to resolve their own distance kernel).
+  Metric metric() const { return metric_; }
+
   // Read-only access to the parallel id array (ids()[i] belongs to the
   // vector at row i).  Used by VectorDB for persistence.
   const std::vector<id_t>& ids() const { return ids_; }
@@ -74,6 +78,7 @@ class FlatIndex {
 
  private:
   const std::size_t dim_;        // fixed dimensionality
+  const Metric metric_;          // metric handed out by metric()
   const DistanceFn dist_;        // resolved scan kernel (never null)
   const bool cosine_pre_;        // metric == kCosine: pre-normalised rows
   std::vector<float> storage_;   // size = size() * dim_, row-major
