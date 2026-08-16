@@ -20,6 +20,7 @@
 //     simulated crash (no close(), no checkpoint).
 //
 // Exit code 0 = all requested scenarios passed.
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -37,8 +38,8 @@
 
 namespace {
 
-int g_failures = 0;
-int g_checks = 0;
+std::atomic<int> g_failures(0);
+std::atomic<int> g_checks(0);
 const char* g_scenario = "?";
 
 // Directory-scoped temp path: /tmp/starry_crash_<name>_<pid>.
@@ -67,9 +68,9 @@ void mkdir_or_die(const std::string& path) {
 
 #define CHECK(cond)                                                        \
   do {                                                                     \
-    ++g_checks;                                                            \
+    g_checks.fetch_add(1, std::memory_order_relaxed);                      \
     if (!(cond)) {                                                         \
-      ++g_failures;                                                        \
+      g_failures.fetch_add(1, std::memory_order_relaxed);                  \
       std::fprintf(stderr, "[%s] CHECK FAILED %s:%d: %s\n", g_scenario,    \
                    __FILE__, __LINE__, #cond);                             \
     }                                                                      \
@@ -78,9 +79,9 @@ void mkdir_or_die(const std::string& path) {
 #define CHECK_FALSE(cond) CHECK(!(cond))
 
 void require_ok(starry::Status s, const char* what) {
-  ++g_checks;
+  g_checks.fetch_add(1, std::memory_order_relaxed);
   if (s != starry::kOk) {
-    ++g_failures;
+    g_failures.fetch_add(1, std::memory_order_relaxed);
     std::fprintf(stderr, "[%s] %s returned status %d\n", g_scenario, what,
                  static_cast<int>(s));
   }
@@ -100,7 +101,15 @@ std::vector<float> det_vector(std::size_t dim, unsigned base) {
   return v;
 }
 
-starry::VectorDB* open_db(const std::string& dir, starry::Status* s) {
+// Fresh open on a NEW directory: explicit schema required by the API.
+starry::VectorDB* open_db(const std::string& dir, starry::Status* s,
+                          std::size_t dim = 4, starry::Metric m = starry::kL2,
+                          starry::IndexKind k = starry::kFlatIndex) {
+  return starry::VectorDB::open(dir, s, dim, m, k).release();
+}
+
+// Reopen of an EXISTING directory: schema comes from starry.meta.
+starry::VectorDB* reopen_db(const std::string& dir, starry::Status* s) {
   return starry::VectorDB::open(dir, s).release();
 }
 
@@ -193,7 +202,7 @@ void s01_create_write_close_reopen() {
   }
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "reopen");
     CHECK(db != 0);
     CHECK(db->size() == 2);
@@ -231,7 +240,7 @@ void s02_wal_tail_torn() {
   CHECK(truncate_file(wal_path(dir), sz - 9));
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open after torn tail");
     CHECK(db->size() >= 19);  // at most the last record lost, never more
     std::vector<float> out;
@@ -268,7 +277,7 @@ void s03_wal_bad_crc() {
   CHECK(flip_byte(wal_path(dir), sz / 3));
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open after corruption");
     // Prefix property: some leading writes present, no crash, no garbage.
     std::vector<float> out;
@@ -305,7 +314,7 @@ void s04_wal_garbage_tail() {
   CHECK(append_garbage(wal_path(dir), 13));
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open after garbage tail");
     CHECK(db->size() == 5);  // nothing lost, garbage ignored
     require_ok(db->close(), "close");
@@ -314,13 +323,14 @@ void s04_wal_garbage_tail() {
   rm_rf(dir);
 }
 
-// S05: snapshot missing, WAL complete: full replay from the log.
+// S05: snapshot missing: the engine refuses to open (silent data
+// loss would violate the no-loss contract; restore from backup).
 void s05_snapshot_missing_wal_replays() {
   const std::string dir = temp_dir("s05");
   rm_rf(dir);
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = open_db(dir, &s, 8);
     require_ok(s, "open");
     for (int i = 0; i < 30; ++i) {
       require_ok(db->insert(static_cast<starry::id_t>(i), det_vector(8, 3)),
@@ -336,11 +346,13 @@ void s05_snapshot_missing_wal_replays() {
   CHECK(file_exists(wal_path(dir)));
   rm_rf(snapshot_path(dir));  // lose the snapshot, keep the WAL
   {
-    starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
-    require_ok(s, "open without snapshot");
-    CHECK(db->size() == 50);
-    require_ok(db->close(), "close");
+    // The WAL only holds the post-checkpoint delta: opening without the
+    // snapshot would silently drop 30 acknowledged writes.  The engine
+    // must refuse (kIoError), forcing an explicit restore from backup.
+    starry::Status s = starry::kOk;
+    starry::VectorDB* db = reopen_db(dir, &s);
+    CHECK(db == 0);
+    CHECK(s == starry::kIoError);
     delete db;
   }
   rm_rf(dir);
@@ -364,7 +376,7 @@ void s06_wal_missing_snapshot_loads() {
   rm_rf(wal_path(dir));
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open without wal");
     CHECK(db->size() == 10);
     require_ok(db->close(), "close");
@@ -373,7 +385,8 @@ void s06_wal_missing_snapshot_loads() {
   rm_rf(dir);
 }
 
-// S07: empty/new directory without any files opens as an empty database.
+// S07: empty/new directory opens as an empty database when an explicit
+// schema is provided (fresh dirs never guess a schema).
 void s07_empty_dir_opens() {
   const std::string dir = temp_dir("s07");
   rm_rf(dir);
@@ -405,7 +418,7 @@ void s08_stale_tmp_ignored() {
   CHECK(write_file_bytes(snapshot_path(dir) + ".tmp", "GARBAGE", 7));
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open with stale tmp");
     CHECK(db->size() == 1);
     require_ok(db->insert(2, det_vector(4, 9)), "insert");
@@ -414,7 +427,7 @@ void s08_stale_tmp_ignored() {
   }
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "reopen");
     CHECK(db->size() == 2);
     require_ok(db->close(), "close");
@@ -445,12 +458,11 @@ void s09_reopen_loop() {
   }
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "final open");
     std::size_t expect = 0;
     std::vector<float> out;
     for (std::size_t r = 0; r < rounds; ++r) {
-      const bool alive = (r % 3 != 1) || (r + 1 >= rounds);
       // r-1 removed when r%3==2 and r>=1; id r-1 stays deleted afterwards.
       const bool removed = (r % 3 == 1) && (r + 1 < rounds);
       CHECK(db->get(static_cast<starry::id_t>(r), &out) == !removed);
@@ -471,7 +483,7 @@ void s10_crash_sync_always() {
   const std::size_t dim = 8;
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = open_db(dir, &s, 8);
     require_ok(s, "open");
     db->set_wal_sync(starry::kSyncAlways);
     for (int i = 0; i < 15; ++i) {
@@ -479,11 +491,13 @@ void s10_crash_sync_always() {
                             det_vector(dim, static_cast<unsigned>(i))),
                  "insert");
     }
-    // Simulated crash: leak the object, never call close().
+    // Simulated crash: no close() (no final fsync); freeing the object
+    // does not add durability, so the crash semantics are preserved.
+    delete db;
   }
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open after crash");
     CHECK(db->size() == 15);
     std::vector<float> out;
@@ -503,17 +517,18 @@ void s11_crash_relaxed_consistent() {
   rm_rf(dir);
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = open_db(dir, &s, 8);
     require_ok(s, "open");
     for (int i = 0; i < 15; ++i) {
       require_ok(db->insert(static_cast<starry::id_t>(i), det_vector(8, 8)),
                  "insert");
     }
-    // Crash: leak, no close.  Writes may or may not have hit the disk;
-    // whatever did must be a clean prefix.
+    // Crash: no close.  Writes may or may not have hit the disk; whatever
+    // did must be a clean prefix.  (Destructor adds no durability.)
+    delete db;
   }
   starry::Status s;
-  starry::VectorDB* db = open_db(dir, &s);
+  starry::VectorDB* db = reopen_db(dir, &s);
   require_ok(s, "open after relaxed crash");
   std::vector<float> out;
   std::size_t present = 0;
@@ -555,7 +570,7 @@ void s12_bulk_atomic() {
   CHECK(truncate_file(wal_path(dir), sz - 17));
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open after torn bulk");
     std::vector<float> out;
     std::size_t bulk_present = 0;
@@ -600,7 +615,7 @@ void s13_hnsw_recovery() {
     // Reopen: graph rebuilt by replay, deterministic seed => the same
     // search answers.
     starry::Status s2;
-    starry::VectorDB* db2 = open_db(dir, &s2);
+    starry::VectorDB* db2 = reopen_db(dir, &s2);
     require_ok(s2, "reopen hnsw");
     CHECK(db2->kind() == starry::kHnswIndex);
     db2->set_search_ef(128);
@@ -623,7 +638,7 @@ void s14_checkpoint_shrinks_wal() {
   const std::size_t dim = 32;
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = open_db(dir, &s, 32);
     require_ok(s, "open");
     for (int i = 0; i < 200; ++i) {
       require_ok(db->insert(static_cast<starry::id_t>(i),
@@ -636,7 +651,7 @@ void s14_checkpoint_shrinks_wal() {
   CHECK(wal_before > 200 * dim * 4 / 2);  // actually holds the writes
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "open");
     require_ok(db->checkpoint(), "checkpoint");
     const std::size_t wal_after = file_size(wal_path(dir));
@@ -649,7 +664,7 @@ void s14_checkpoint_shrinks_wal() {
   // And the checkpointed state survives a crash-before-close.
   {
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     require_ok(s, "reopen after checkpoint");
     CHECK(db->size() == 200);
     delete db;
@@ -664,7 +679,7 @@ void s15_concurrent_readers_writer() {
   rm_rf(dir);
   const std::size_t dim = 8;
   starry::Status s;
-  starry::VectorDB* db = open_db(dir, &s);
+  starry::VectorDB* db = open_db(dir, &s, 8);
   require_ok(s, "open");
   db->set_wal_sync(starry::kSyncAlways);
   for (int i = 0; i < 100; ++i) {
@@ -735,7 +750,7 @@ void s16_wal_fuzz() {
     }
     // Must open (or cleanly fail) - never crash.
     starry::Status s;
-    starry::VectorDB* db = open_db(dir, &s);
+    starry::VectorDB* db = reopen_db(dir, &s);
     if (db != 0) {
       // Whatever survived must be a prefix of 0..11.
       std::vector<float> out;
@@ -763,7 +778,7 @@ const Scenario kScenarios[] = {
     {"s02_wal_tail_torn", s02_wal_tail_torn},
     {"s03_wal_bad_crc", s03_wal_bad_crc},
     {"s04_wal_garbage_tail", s04_wal_garbage_tail},
-    {"s05_snapshot_missing_wal_replays", s05_snapshot_missing_wal_replays},
+    {"s05_snapshot_missing_refuses", s05_snapshot_missing_wal_replays},
     {"s06_wal_missing_snapshot_loads", s06_wal_missing_snapshot_loads},
     {"s07_empty_dir_opens", s07_empty_dir_opens},
     {"s08_stale_tmp_ignored", s08_stale_tmp_ignored},
@@ -799,13 +814,13 @@ int main(int argc, char** argv) {
       return 2;
     }
     g_scenario = kScenarios[idx].name;
-    const int before = g_failures;
+    const int before = g_failures.load();
     std::printf("  [%2d] %-36s ... ", idx + 1, g_scenario);
     std::fflush(stdout);
     kScenarios[idx].fn();
-    std::printf("%s\n", g_failures == before ? "ok" : "FAILED");
+    std::printf("%s\n", g_failures.load() == before ? "ok" : "FAILED");
   }
-  std::printf("starry_crash_suite: %d checks, %d failures\n", g_checks,
-              g_failures);
-  return g_failures == 0 ? 0 : 1;
+  std::printf("starry_crash_suite: %d checks, %d failures\n",
+              g_checks.load(), g_failures.load());
+  return g_failures.load() == 0 ? 0 : 1;
 }
