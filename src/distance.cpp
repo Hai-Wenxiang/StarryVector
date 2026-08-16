@@ -27,20 +27,18 @@ float inner_product_distance_avx2(const float* a, const float* b,
 
 namespace {
 
-// True when the process may use AVX2+FMA kernels.
+// True when the process may use AVX2+FMA kernels.  Compiled down to a
+// constant "false" in scalar-only builds (STARRY_DISABLE_SIMD).
+#if defined(STARRY_HAVE_AVX2)
 bool cpu_has_avx2() {
-#if defined(STARRY_HAVE_AVX2) && \
-    (defined(__x86_64__) || defined(__i386__))
   return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
-#else
-  return false;
-#endif
 }
 
 bool force_scalar_env() {
   const char* v = std::getenv("STARRY_FORCE_SCALAR");
   return v != 0 && v[0] != '\0' && std::strcmp(v, "0") != 0;
 }
+#endif
 
 bool avx2_usable() {
 #if defined(STARRY_HAVE_AVX2)

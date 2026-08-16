@@ -1,5 +1,7 @@
 # StarryVector
 
+[![CI](https://github.com/Hai-Wenxiang/StarryVector/actions/workflows/ci.yml/badge.svg)](https://github.com/Hai-Wenxiang/StarryVector/actions/workflows/ci.yml)
+
 **English** | [简体中文](README.zh-CN.md)
 
 A high-performance **vector database for RAG (Retrieval-Augmented Generation)** for **Linux**, written in portable **C++17** (GCC 7+, Clang 5+). Windows is not a supported platform.
