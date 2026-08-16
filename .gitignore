@@ -21,3 +21,4 @@ clangd/
 # System
 .DS_Store
 *.log
+validation/out/
