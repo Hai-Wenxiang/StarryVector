@@ -36,6 +36,12 @@ add_executable(starry_bench apps/bench_main.cpp)
 target_link_libraries(starry_bench PRIVATE starry_core Threads::Threads)
 
 # ---------------------------------------------------------------------------
+# RAG retrieval example (see examples/rag_demo.cpp).
+# ---------------------------------------------------------------------------
+add_executable(starry_rag_demo examples/rag_demo.cpp)
+target_link_libraries(starry_rag_demo PRIVATE starry_core Threads::Threads)
+
+# ---------------------------------------------------------------------------
 # Unit tests (doctest, vendored under third_party/, C++11 compatible).
 # ---------------------------------------------------------------------------
 enable_testing()

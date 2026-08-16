@@ -75,6 +75,7 @@ StarryVector/
 ├── include/starry/   # Public headers (types, distance, flat_index, db)
 ├── src/              # Library implementation (zero dependencies)
 ├── apps/             # Benchmark driver (starry_bench)
+├── examples/         # RAG retrieval demo (starry_rag_demo)
 ├── tests/            # Unit tests (doctest, vendored)
 ├── validation/       # Python harness -> HTML performance report
 └── third_party/      # Vendored dev-only dependencies (doctest)
