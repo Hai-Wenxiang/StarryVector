@@ -6,20 +6,20 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 
 ## Features
 
-- **ANN Indexes** — HNSW graph index and IVF (inverted file) index for approximate nearest neighbor search
-- **Exact Search** — brute-force kNN with SIMD-accelerated (AVX2/AVX-512/NEON) distance computations (L2, inner product, cosine)
-- **Metadata Filtering** — combine vector search with scalar attribute filters
-- **Persistence** — memory-mapped (mmap) storage format with incremental snapshots
-- **Simple API** — clean C++ interface plus a lightweight HTTP server mode
+- **Exact Search (available now)** — brute-force kNN with scalar distance kernels (L2, inner product, cosine), 100% recall by construction
+- **Persistence** — single-file `save()` / `load()` with tombstone-aware soft deletion
+- **ANN Indexes** (planned) — HNSW graph index and IVF with quantization, validated against the exact core
+- **Metadata Filtering** (planned) — combine vector search with scalar attribute filters
+- **Simple API** — clean C++11 interface; status codes instead of exceptions
 
 ## Roadmap
 
-- [ ] Core vector storage & exact kNN search
+- [x] Core vector storage & exact kNN search
 - [ ] SIMD distance kernels
 - [ ] HNSW index
 - [ ] IVF index with k-means clustering
 - [ ] Metadata filtering
-- [ ] Persistence & snapshots
+- [ ] WAL + mmap storage engine
 - [ ] HTTP server (REST) interface
 - [ ] Python client bindings
 
@@ -27,43 +27,58 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 
 Requirements:
 
-- C++11 compliant compiler (GCC 4.9+, Clang 3.5+, or MSVC 2015+)
-- CMake 3.20+
+- C++11 compliant compiler (GCC 4.9+, Clang 3.5+, or MSVC 2017 15.7+)
+- CMake 3.10+
 
 ```bash
 git clone https://github.com/Hai-Wenxiang/StarryVector.git
 cd StarryVector
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
+ctest --test-dir build --output-on-failure   # unit tests
 ```
 
 ## Quick Start
 
 ```cpp
-#include <starryvector/db.hpp>
+#include <starry/db.hpp>
 
 int main() {
     starry::VectorDB db(768);  // dimension of embeddings
 
-    db.insert(1, {0.1f, 0.2f, /* ... */});
+    db.insert(1, {0.1f, 0.2f, /* ... */});   // returns starry::kOk
     db.insert(2, {0.3f, 0.4f, /* ... */});
 
     auto results = db.search({0.1f, 0.2f, /* ... */}, /*k=*/10);
     for (const auto& hit : results) {
         // hit.id, hit.distance — top-k nearest neighbors
     }
+
+    db.save("myvectors.bin");                // single-file persistence
 }
 ```
+
+## Benchmarks & Validation
+
+```bash
+python3 validation/run_validation.py --open
+```
+
+Runs a benchmark matrix (dataset size / threads / dimensions / metrics)
+and opens a self-contained HTML report. Requires `python3-matplotlib`.
+See [validation/README.md](validation/README.md).
 
 ## Project Layout
 
 ```
 StarryVector/
-├── include/    # Public headers
-├── src/        # Library implementation
-├── tests/      # Unit tests
-├── benchmarks/ # Performance benchmarks
-└── examples/   # Usage examples
+├── include/starry/   # Public headers (types, distance, flat_index, db)
+├── src/              # Library implementation (zero dependencies)
+├── apps/             # Benchmark driver (starry_bench)
+├── examples/         # RAG retrieval demo (starry_rag_demo)
+├── tests/            # Unit tests (doctest, vendored)
+├── validation/       # Python harness -> HTML performance report
+└── third_party/      # Vendored dev-only dependencies (doctest)
 ```
 
 ## License
