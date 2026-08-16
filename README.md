@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A high-performance **vector database for RAG (Retrieval-Augmented Generation)** for **Linux**, written in portable **C++17** (GCC 7+, Clang 5+). Windows is not a supported platform.
+A high-performance **vector database for RAG (Retrieval-Augmented Generation)** for **Linux**, written in portable **C++17** (GCC 9+, Clang 14+, both covered by the CI matrix). Windows is not a supported platform.
 
 StarryVector provides efficient storage, indexing, and similarity search for high-dimensional embedding vectors, designed to serve as the retrieval backbone of RAG pipelines.
 
@@ -40,7 +40,7 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 
 Requirements:
 
-- Linux with a C++17 compliant compiler (GCC 7+ or Clang 5+)
+- Linux with a C++17 compliant compiler — GCC 9+ or Clang 14+ (the versions the CI matrix actually builds and tests; older compilers have no runnable CI environment any more and are untested)
 - CMake 3.10+
 
 ```bash

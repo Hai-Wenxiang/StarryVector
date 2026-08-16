@@ -4,7 +4,7 @@
 
 [English](README.md) | **简体中文**
 
-面向 RAG（检索增强生成）的高性能**向量数据库**，仅支持 **Linux**，使用可移植的 **C++17** 编写（GCC 7+、Clang 5+）。不支持 Windows 平台。
+面向 RAG（检索增强生成）的高性能**向量数据库**，仅支持 **Linux**，使用可移植的 **C++17** 编写（GCC 9+、Clang 14+，均在 CI 矩阵实测覆盖）。不支持 Windows 平台。
 
 StarryVector 为高维 embedding 向量提供高效的存储、索引与相似度检索，定位是 RAG 流水线中的检索底座。
 
@@ -40,7 +40,7 @@ StarryVector 为高维 embedding 向量提供高效的存储、索引与相似�
 
 要求：
 
-- Linux，支持 C++17 的编译器（GCC 7+ 或 Clang 5+）
+- Linux，支持 C++17 的编译器 —— GCC 9+ 或 Clang 14+（CI 矩阵实际构建并测试过的版本；更老的编译器已无可用的 CI 运行环境，未做验证）
 - CMake 3.10+
 
 ```bash
