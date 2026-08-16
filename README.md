@@ -14,6 +14,9 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 - **One binary, any x86 machine** — SIMD is dispatched at runtime (`__builtin_cpu_supports`), so a single build runs everywhere from old servers to new desktops. Set `STARRY_FORCE_SCALAR=1` to force the scalar path.
 - **Real deletion** — tombstone-based soft delete works with both indexes; deleted rows disappear from searches immediately.
 - **Single-file persistence** — `save()` / `load()` with a versioned, little-endian format (`STARRYV2` stores the HNSW graph; older `STARRYV1` flat files still load).
+- **Durable directory mode (WAL)** — `VectorDB::open(dir, ...)` attaches to a database directory: every mutation is logged to a CRC-checked write-ahead log before it is acknowledged, `checkpoint()` atomically rewrites the snapshot and truncates the log, and recovery replays a clean prefix after torn writes or crashes (`kSyncAlways` fsyncs every acknowledged write). Crash semantics are pinned by a 17-scenario fault-injection suite (`starry_crash_suite`, part of `ctest`).
+- **Concurrent reads** — `std::shared_mutex` read-write lock: searches and point lookups run in parallel with each other while a single writer mutates (TSan-verified).
+- **mmap zero-copy recovery** — snapshots load by adopting the mapped file bytes directly (~32x faster loads of a 50 MiB snapshot); the first write materialises the view (copy-on-write).
 - **Zero dependencies** — the core library uses only the C++ standard library. The single vendored header (doctest) is a dev-only test dependency.
 - **Simple API** — status codes instead of exceptions; RAII throughout.
 
@@ -30,9 +33,9 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 - [x] Core vector storage & exact kNN search
 - [x] SIMD distance kernels (AVX2, runtime dispatch, `STARRY_FORCE_SCALAR=1` to disable)
 - [x] HNSW index
+- [x] WAL + mmap storage engine (directory mode, checkpoints, crash-safe recovery, concurrent readers)
 - [ ] IVF index with k-means clustering
 - [ ] Metadata filtering
-- [ ] WAL + mmap storage engine
 - [ ] HTTP server (REST) interface
 - [ ] Python client bindings
 
@@ -113,6 +116,27 @@ for (/* every document chunk */) {
 }
 auto hits = db.search(query_embedding, 10);   // approximate top-k
 ```
+
+Durable directory mode (WAL + checkpoints):
+
+```cpp
+// Fresh database: an explicit schema creates the directory.
+starry::Status s;
+std::unique_ptr<starry::VectorDB> db =
+    starry::VectorDB::open("./mydb", &s, 768, starry::kCosine,
+                           starry::kHnswIndex);
+db->set_wal_sync(starry::kSyncAlways);  // fsync every acknowledged write
+
+db->insert_bulk(ids, vecs);
+db->checkpoint();   // atomic snapshot rewrite + WAL truncation
+
+// Any later open() recovers: snapshot restore + WAL prefix replay.
+// Torn tails / corrupted records are detected by CRC and dropped;
+// a 17-scenario fault-injection suite (starry_crash_suite) pins this.
+```
+
+Readers may call `search()` / `get()` concurrently (shared lock); one
+writer mutates at a time (exclusive lock).
 
 ## Benchmarks & Validation
 
