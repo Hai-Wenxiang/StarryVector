@@ -1,11 +1,20 @@
 // Implementation of the brute-force FlatIndex.
 #include "starry/flat_index.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace starry {
 
 namespace {
+
+// Max-heap ordering over the candidate buffer: the heap top is the
+// WORST (largest-distance) hit, so evictions and rejections are O(1).
+struct Farther {
+  bool operator()(const SearchResult& a, const SearchResult& b) const {
+    return a.distance < b.distance;
+  }
+};
 
 // L2-normalises `dim` floats in place; a zero vector is left unchanged
 // (the caller relies on it behaving as "distance 1 to everything").
@@ -51,15 +60,13 @@ void FlatIndex::add(id_t id, const float* vec) {
 std::vector<SearchResult> FlatIndex::search(
     const float* query, std::size_t k,
     const std::unordered_set<id_t>* skip) const {
-  std::vector<SearchResult> best;  // kept sorted by ascending distance
+  std::vector<SearchResult> best;  // heap of the k best, worst on top
   if (k == 0) {
     return best;
   }
-  best.reserve(k + 1);
 
   // Cosine searches normalise the query once instead of paying two norm
-  // reductions per database row.  C++17: scratch is thread-local by
-  // lifetime, sized per call; dim_ is small so this stays cache friendly.
+  // reductions per database row.
   std::vector<float> query_scratch;
   const float* q = query;
   if (cosine_pre_) {
@@ -69,6 +76,7 @@ std::vector<SearchResult> FlatIndex::search(
   }
 
   const std::size_t n = ids_.size();
+  float worst = 0.0f;  // distance of the current k-th best (heap top)
   for (std::size_t i = 0; i < n; ++i) {
     float d = dist_(q, &storage_[i * dim_], dim_);
     if (cosine_pre_) {
@@ -76,10 +84,10 @@ std::vector<SearchResult> FlatIndex::search(
       d += 1.0f;
     }
 
-    // Cheap rejection first: if the buffer is full and the candidate is
-    // not better than the current k-th hit, drop it without touching
-    // the skip set (avoids a hash lookup for the common case).
-    if (best.size() == k && d >= best[k - 1].distance) {
+    // Cheap rejection first: when the buffer is full, anything not
+    // better than the current k-th hit is dropped without touching the
+    // skip set (avoids a hash lookup for the common case).
+    if (best.size() == k && d >= worst) {
       continue;
     }
     // Second rejection: soft-deleted ids pretend not to exist.
@@ -87,24 +95,23 @@ std::vector<SearchResult> FlatIndex::search(
       continue;
     }
 
-    // Insert the candidate into its sorted position.  A shift-back
-    // insertion over at most k elements is the classic primitive top-k
-    // selection; k is small (typically 10..100) so this beats any
-    // heap for clarity while staying cache friendly.
     SearchResult hit;
     hit.id = ids_[i];
     hit.distance = d;
-    best.push_back(hit);
-    std::size_t j = best.size() - 1;
-    while (j > 0 && best[j - 1].distance > d) {
-      best[j] = best[j - 1];
-      --j;
-    }
-    best[j] = hit;
-    if (best.size() > k) {
-      best.pop_back();
+    if (best.size() < k) {
+      best.push_back(hit);
+      std::push_heap(best.begin(), best.end(), Farther());
+      worst = best.front().distance;
+    } else {
+      std::pop_heap(best.begin(), best.end(), Farther());
+      best.back() = hit;
+      std::push_heap(best.begin(), best.end(), Farther());
+      worst = best.front().distance;
     }
   }
+
+  // The caller contract is ascending distance order.
+  std::sort_heap(best.begin(), best.end(), Farther());
   return best;
 }
 
