@@ -71,7 +71,8 @@ class VectorDB {
                                    std::size_t k) const;
 
   // Copies the stored vector for `id` into *out.  Returns false when the
-  // id is unknown or deleted.
+  // id is unknown or deleted.  Note: with the cosine metric the stored
+  // (and returned) vector is L2-normalised, by design of FlatIndex.
   bool get(id_t id, std::vector<float>* out) const;
 
   // Number of live (non-deleted) vectors.

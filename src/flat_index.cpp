@@ -1,10 +1,36 @@
 // Implementation of the brute-force FlatIndex.
 #include "starry/flat_index.hpp"
 
+#include <cmath>
+
 namespace starry {
 
+namespace {
+
+// L2-normalises `dim` floats in place; a zero vector is left unchanged
+// (the caller relies on it behaving as "distance 1 to everything").
+void l2_normalize(float* v, std::size_t dim) {
+  float sum = 0.0f;
+  for (std::size_t i = 0; i < dim; ++i) {
+    sum += v[i] * v[i];
+  }
+  if (sum > 0.0f) {
+    const float inv = 1.0f / std::sqrt(sum);
+    for (std::size_t i = 0; i < dim; ++i) {
+      v[i] *= inv;
+    }
+  }
+}
+
+}  // namespace
+
 FlatIndex::FlatIndex(std::size_t dim, Metric metric)
-    : dim_(dim), dist_(resolve_distance_fn(metric)) {
+    : dim_(dim),
+      // With pre-normalisation the cosine scan is a plain inner product;
+      // search() adds the constant +1 to get back to cosine distance.
+      dist_(metric == kCosine ? &inner_product_distance
+                              : resolve_distance_fn(metric)),
+      cosine_pre_(metric == kCosine) {
   // Reserve nothing yet; the caller-driven insert pattern of the first
   // milestone relies on vector growth being amortised O(1), which is
   // good enough for bulk loads of a few million vectors.
@@ -15,6 +41,9 @@ void FlatIndex::add(id_t id, const float* vec) {
   // prefetcher-friendly even in this scalar version).
   storage_.insert(storage_.end(), vec, vec + dim_);
   ids_.push_back(id);
+  if (cosine_pre_) {
+    l2_normalize(&storage_[storage_.size() - dim_], dim_);
+  }
 }
 
 std::vector<SearchResult> FlatIndex::search(
@@ -26,9 +55,24 @@ std::vector<SearchResult> FlatIndex::search(
   }
   best.reserve(k + 1);
 
+  // Cosine searches normalise the query once instead of paying two norm
+  // reductions per database row.  C++17: scratch is thread-local by
+  // lifetime, sized per call; dim_ is small so this stays cache friendly.
+  std::vector<float> query_scratch;
+  const float* q = query;
+  if (cosine_pre_) {
+    query_scratch.assign(query, query + dim_);
+    l2_normalize(&query_scratch[0], dim_);
+    q = &query_scratch[0];
+  }
+
   const std::size_t n = ids_.size();
   for (std::size_t i = 0; i < n; ++i) {
-    const float d = dist_(query, &storage_[i * dim_], dim_);
+    float d = dist_(q, &storage_[i * dim_], dim_);
+    if (cosine_pre_) {
+      // ip kernel returned -dot; unit vectors: cosine distance = 1 - dot.
+      d += 1.0f;
+    }
 
     // Cheap rejection first: if the buffer is full and the candidate is
     // not better than the current k-th hit, drop it without touching
