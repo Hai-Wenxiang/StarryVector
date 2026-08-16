@@ -97,6 +97,39 @@ Status VectorDB::insert(id_t id, const std::vector<float>& vec) {
   return insert(id, &vec[0]);
 }
 
+Status VectorDB::insert_bulk(const std::vector<id_t>& ids,
+                             const std::vector<float>& vecs,
+                             std::size_t threads) {
+  if (vecs.size() != ids.size() * dim_) {
+    return kInvalidArgument;
+  }
+  if (ids.empty()) {
+    return kOk;
+  }
+  // Atomic validation: no duplicates inside the batch, none against the
+  // live ids.  Only after the whole batch passes are rows appended.
+  std::unordered_set<id_t> batch(ids.begin(), ids.end());
+  if (batch.size() != ids.size()) {
+    return kDuplicateId;
+  }
+  for (std::unordered_set<id_t>::const_iterator it = batch.begin();
+       it != batch.end(); ++it) {
+    if (row_of_.find(*it) != row_of_.end()) {
+      return kDuplicateId;
+    }
+  }
+  const std::size_t start = index_.size();
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    row_of_[ids[i]] = start + i;
+    index_.add(ids[i], &vecs[i * dim_]);
+    deleted_.erase(ids[i]);  // revived, as with insert()
+  }
+  if (hnsw_ != 0) {
+    hnsw_->add_rows_bulk(ids.size(), threads);
+  }
+  return kOk;
+}
+
 Status VectorDB::remove(id_t id) {
   std::unordered_map<id_t, std::size_t>::iterator it = row_of_.find(id);
   if (it == row_of_.end()) {

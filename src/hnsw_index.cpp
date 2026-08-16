@@ -9,8 +9,10 @@
 #include "starry/hnsw_index.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <queue>
+#include <thread>
 #include <utility>
 
 #include "starry/flat_index.hpp"
@@ -21,6 +23,12 @@ namespace {
 
 // Distance-tagged row used inside the beam searches.
 typedef std::pair<float, std::int32_t> Hit;  // (distance, row)
+
+// Wave size of the deterministic parallel bulk build.  A compile-time
+// constant on purpose: the constructed graph must depend only on
+// (data, seed, call sequence), never on the number of worker threads,
+// so the wave boundaries have to be fixed as well.
+const std::size_t kBulkWave = 32;
 
 // std::priority_queue puts the "largest" element (per comparator) on top:
 //   Farther  -> top is the entry with the LARGEST distance (use: beam
@@ -67,8 +75,15 @@ float HnswIndex::row_row_dist(std::size_t a, std::size_t b) const {
   return dist_(&storage[a * dim_], &storage[b * dim_], dim_);
 }
 
+std::int32_t HnswIndex::draw_level() {
+  std::uniform_real_distribution<double> unif01(0.0, 1.0);
+  std::int32_t level = static_cast<std::int32_t>(
+      -std::log(unif01(level_rng_)) * level_mult_);
+  return level < 0 ? 0 : level;
+}
+
 void HnswIndex::select_heuristic(const float* q,
-                                 std::vector<std::int32_t>& cands,
+                                 const std::vector<std::int32_t>& cands,
                                  std::size_t M,
                                  std::vector<std::int32_t>* out) const {
   // Candidates arrive sorted nearest-first.
@@ -180,12 +195,7 @@ void HnswIndex::add_row(std::size_t row) {
   }
 
   // Exponential level assignment.
-  std::uniform_real_distribution<double> unif01(0.0, 1.0);
-  std::int32_t level = static_cast<std::int32_t>(
-      -std::log(unif01(level_rng_)) * level_mult_);
-  if (level < 0) {
-    level = 0;
-  }
+  const std::int32_t level = draw_level();
 
   Node node;
   node.level = level;
@@ -286,6 +296,205 @@ void HnswIndex::add_row(std::size_t row) {
   if (level > max_level_) {
     max_level_ = level;
     entry_ = static_cast<std::int64_t>(row);
+  }
+}
+
+// ---- deterministic parallel bulk construction ------------------------------
+//
+// Wave algorithm (see add_rows_bulk in the header): rows are appended in
+// waves of kBulkWave.  Within a wave every node's candidate search runs
+// in parallel against the frozen graph prefix (nodes below the wave
+// start); linking then happens sequentially in row order.  Both phases
+// are pure functions of the frozen state, so thread count and scheduling
+// cannot influence the resulting graph.
+
+void HnswIndex::plan_row(std::size_t row, std::size_t efc,
+                         BulkPlan* plan) const {
+  plan->frozen_max_level = max_level_;
+  plan->layers.assign(static_cast<std::size_t>(plan->level) + 1,
+                      std::vector<std::int32_t>());
+  if (entry_ < 0) {
+    return;  // empty graph: link_row() handles the entry bootstrap
+  }
+
+  const std::vector<float>& storage = base_.storage();
+  const float* q = &storage[row * dim_];
+
+  // Greedy descent with ef = 1 from the top layer to level+1 (the
+  // graph state here is frozen, so this is read-only).
+  std::int32_t cur = static_cast<std::int32_t>(entry_);
+  float cur_d = row_dist(q, static_cast<std::size_t>(cur));
+  for (std::int32_t l = max_level_; l > plan->level; --l) {
+    bool improved = true;
+    while (improved) {
+      improved = false;
+      const std::vector<std::int32_t>& nbrs =
+          nodes_[static_cast<std::size_t>(cur)].links[static_cast<std::size_t>(l)];
+      for (std::size_t ni = 0; ni < nbrs.size(); ++ni) {
+        const std::int32_t n = nbrs[ni];
+        if (n < 0 || static_cast<std::size_t>(n) >= node_count_) {
+          continue;
+        }
+        const float d = row_dist(q, static_cast<std::size_t>(n));
+        if (d < cur_d) {
+          cur_d = d;
+          cur = n;
+          improved = true;
+        }
+      }
+    }
+  }
+
+  // ef_construction-bounded candidate search on every layer from
+  // min(level, max_level) down to 0, chaining the entry sets exactly
+  // like add_row() does.
+  std::vector<Hit> layer_hits;
+  std::vector<std::int32_t> entries(1, cur);
+  for (std::int32_t l = std::min(plan->level, max_level_); l >= 0; --l) {
+    search_layer(q, efc, entries, 0, &layer_hits,
+                 static_cast<std::size_t>(l));
+    std::vector<std::int32_t>& cands =
+        plan->layers[static_cast<std::size_t>(l)];
+    cands.reserve(layer_hits.size());
+    for (std::size_t i = 0; i < layer_hits.size(); ++i) {
+      cands.push_back(layer_hits[i].second);
+    }
+    entries.clear();
+    for (std::size_t i = 0; i < layer_hits.size() && i < efc; ++i) {
+      entries.push_back(layer_hits[i].second);
+    }
+    if (entries.empty()) {
+      entries.push_back(static_cast<std::int32_t>(entry_));
+    }
+  }
+}
+
+void HnswIndex::link_row(std::size_t row, const BulkPlan& plan) {
+  Node node;
+  node.level = plan.level;
+  node.links.resize(static_cast<std::size_t>(plan.level) + 1);
+  nodes_.push_back(node);
+  ++node_count_;
+
+  if (entry_ < 0) {
+    // Bootstrap of an empty graph: this row is the entry point of every
+    // layer up to its level (mirrors the first-node case of add_row).
+    entry_ = static_cast<std::int64_t>(row);
+    max_level_ = plan.level;
+    return;
+  }
+
+  const std::vector<float>& storage = base_.storage();
+  const float* q = &storage[row * dim_];
+
+  // Layers above frozen_max_level have no candidates (the frozen prefix
+  // did not reach them); their link lists stay empty and the node is
+  // still reachable through lower layers.
+  std::vector<std::int32_t> selected;
+  for (std::int32_t l = std::min(plan.level, plan.frozen_max_level);
+       l >= 0; --l) {
+    const std::vector<std::int32_t>& cands =
+        plan.layers[static_cast<std::size_t>(l)];
+    select_heuristic(q, cands, M_, &selected);
+    nodes_[row].links[static_cast<std::size_t>(l)] = selected;
+
+    // Back-link and shrink overfull lists (identical to add_row).
+    const std::size_t cap = l == 0 ? M0_ : M_;
+    for (std::size_t i = 0; i < selected.size(); ++i) {
+      const std::int32_t n = selected[i];
+      std::vector<std::int32_t>& nl =
+          nodes_[static_cast<std::size_t>(n)].links[static_cast<std::size_t>(l)];
+      nl.push_back(static_cast<std::int32_t>(row));
+      if (nl.size() > cap) {
+        std::vector<std::int32_t> merged = nl;
+        const float* nv =
+            &base_.storage()[static_cast<std::size_t>(n) * dim_];
+        std::sort(merged.begin(), merged.end(),
+                  [&](std::int32_t a, std::int32_t b) {
+                    return row_row_dist(static_cast<std::size_t>(a),
+                                        static_cast<std::size_t>(n)) <
+                           row_row_dist(static_cast<std::size_t>(b),
+                                        static_cast<std::size_t>(n));
+                  });
+        select_heuristic(nv, merged, cap, &nl);
+      }
+    }
+  }
+
+  if (plan.level > max_level_) {
+    max_level_ = plan.level;
+    entry_ = static_cast<std::int64_t>(row);
+  }
+}
+
+void HnswIndex::add_rows_bulk(std::size_t n, std::size_t threads) {
+  if (n == 0) {
+    return;
+  }
+  if (threads == 0) {
+    threads = std::thread::hardware_concurrency();
+    if (threads == 0) {
+      threads = 1;
+    }
+  }
+  const std::size_t efc = ef_construction_ > M0_ ? ef_construction_ : M0_;
+  const std::size_t end_row = node_count_ + n;
+
+  // Bootstrap: an empty graph gets its entry point serially before any
+  // wave runs (planning needs a graph to descend from).
+  if (entry_ < 0) {
+    BulkPlan plan;
+    plan.level = draw_level();
+    plan.frozen_max_level = -1;
+    link_row(node_count_, plan);
+  }
+
+  std::size_t w = node_count_;
+  while (w < end_row) {
+    const std::size_t wend = w + kBulkWave < end_row ? w + kBulkWave : end_row;
+    const std::size_t wn = wend - w;
+
+    // Levels for the whole wave, drawn in row order (same generator as
+    // add_row, same consumption order regardless of thread count).
+    std::vector<std::int32_t> levels(wn);
+    for (std::size_t i = 0; i < wn; ++i) {
+      levels[i] = draw_level();
+    }
+
+    // Parallel phase: read-only planning against the frozen prefix.
+    // Workers grab node indices from an atomic counter; every write goes
+    // to the worker's own plan slot, so scheduling cannot be observed.
+    std::vector<BulkPlan> plans(wn);
+    std::atomic<std::size_t> next(0);
+    auto worker = [&]() {
+      for (;;) {
+        const std::size_t i = next.fetch_add(1);
+        if (i >= wn) {
+          break;
+        }
+        plans[i].level = levels[i];
+        plan_row(w + i, efc, &plans[i]);
+      }
+    };
+    if (threads > 1 && wn > 1) {
+      std::vector<std::thread> pool;
+      pool.reserve(threads - 1);
+      for (std::size_t t = 1; t < threads; ++t) {
+        pool.push_back(std::thread(worker));
+      }
+      worker();
+      for (std::size_t t = 0; t < pool.size(); ++t) {
+        pool[t].join();
+      }
+    } else {
+      worker();
+    }
+
+    // Sequential phase: link the wave in row order.
+    for (std::size_t i = 0; i < wn; ++i) {
+      link_row(w + i, plans[i]);
+    }
+    w = wend;
   }
 }
 

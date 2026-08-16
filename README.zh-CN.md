@@ -20,7 +20,7 @@ StarryVector 为高维 embedding 向量提供高效的存储、索引与相似�
 ## 功能
 
 - **精确检索** —— SIMD 距离内核（L2、内积、cosine）的暴力 kNN，构造上 100% 召回。O(n log k) 有界堆 top-k 选择。
-- **HNSW 近似索引** —— 分层可导航小世界图（Malkov & Yashunin, 2016），支持增量插入、多样性邻居选择、可调 `ef` 搜索束宽。固定随机种子，索引可复现。
+- **HNSW 近似索引** —— 分层可导航小世界图（Malkov & Yashunin, 2016），支持增量插入、多样性邻居选择、可调 `ef` 搜索束宽。固定随机种子，索引可复现；`insert_bulk()` 在**不牺牲确定性**的前提下并行构建——相同批次无论线程数多少都得到逐位一致的图，召回与搜索速度和逐行构建持平（8 核实测构建提速 3.2 倍）。
 - **持久化** —— 单文件 `save()` / `load()`，支持 tombstone 软删除。
 - **IVF + 量化**（规划中）—— 第二引擎，内存友好的扫描方式，以精确核心为基准验证。
 - **元数据过滤**（规划中）—— 向量检索与标量属性过滤组合。
@@ -57,6 +57,21 @@ ctest --test-dir build --output-on-failure   # 单元测试
 |---|---|---|
 | `STARRY_DISABLE_SIMD` | `OFF` | 完全跳过 AVX2 内核（仅标量） |
 
+### 安装与集成
+
+安装库与头文件（默认前缀 `/usr/local`，可用 `--prefix` 覆盖；CMake 3.15 以下用 `make install`）：
+
+```bash
+cmake --install build --prefix /path/to/install
+```
+
+在其他 CMake 项目中使用（安装后通过 `find_package`，或将本仓库直接 `add_subdirectory` 后链接 `starry_core`）：
+
+```cmake
+find_package(StarryVector 0.1 REQUIRED)   # 版本兼容策略：同主版本号
+target_link_libraries(my_app PRIVATE StarryVector::starry_core)
+```
+
 ## 快速上手
 
 ```cpp
@@ -85,6 +100,13 @@ int main() {
 starry::VectorDB db(768, starry::kL2, starry::kHnswIndex);
 db.set_search_ef(128);   // 越大召回越高、越慢
 
+// 批量路径：确定性并行构图。图只取决于（向量、顺序、种子），
+// 与线程数无关；多核机器上构建快 3 倍以上。
+std::vector<starry::id_t> ids = /* 切块 id */;
+std::vector<float> vecs = /* 行主序，ids.size() * db.dim() 个浮点数 */;
+db.insert_bulk(ids, vecs);   // 线程数默认 hardware_concurrency
+
+// 增量路径（语义相同，逐行插入）：
 for (/* 每个文档切块 */) {
     db.insert(chunk_id, embedding);
 }
@@ -99,6 +121,9 @@ auto hits = db.search(query_embedding, 10);   // 近似 top-k
 
 # HNSW 基准（以精确核心为 ground truth 统计召回）
 ./build/bin/starry_bench --index hnsw --ef 64 --dim 16 --n 100000
+
+# HNSW 确定性并行批量构建（--threads 个工作线程）
+./build/bin/starry_bench --index hnsw --build bulk --threads 8 --ef 64 --dim 16 --n 100000
 
 # 完整基准矩阵 -> HTML 报告
 python3 validation/run_validation.py --open

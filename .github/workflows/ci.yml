@@ -7,11 +7,14 @@
 #                         benchmark smoke run.
 #   scalar              - STARRY_DISABLE_SIMD=ON build to keep the pure
 #                         scalar fallback compiling and passing.
+#
+# Runs on every push to master or a dev branch, and on PRs targeting
+# master (the merge path dev -> master).
 name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [master, 'dev**']
   pull_request:
     branches: [master]
 

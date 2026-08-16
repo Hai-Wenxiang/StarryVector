@@ -19,9 +19,15 @@
 //
 // Usage:
 //   starry_bench [--dim N] [--n N] [--k N] [--metric l2|ip|cosine]
-//                [--queries N] [--threads N] [--seed N]
+//                [--index flat|hnsw] [--build serial|bulk]
+//                [--queries N] [--threads N] [--seed N] [--ef N]
 //
-// Defaults: dim=128 n=100000 k=10 metric=l2 queries=200 threads=1 seed=42
+// Defaults: dim=128 n=100000 k=10 metric=l2 queries=200 threads=1
+//           seed=42 build=serial
+//
+// --build bulk feeds the dataset through VectorDB::insert_bulk() with
+// --threads workers (deterministic parallel HNSW construction); serial
+// keeps the classic row-by-row insert() path for comparability.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -80,6 +86,7 @@ struct Config {
   std::size_t threads = 1;
   std::uint32_t seed = 42;
   std::string index = "flat";  // flat | hnsw
+  std::string build = "serial";  // serial | bulk
   std::size_t ef = 0;          // 0 -> library default
 };
 
@@ -101,12 +108,14 @@ bool parse_args(int argc, char** argv, Config* cfg) {
     else if (arg == "--threads") cfg->threads = std::strtoul(val, 0, 10);
     else if (arg == "--seed") cfg->seed = static_cast<std::uint32_t>(std::strtoul(val, 0, 10));
     else if (arg == "--index") cfg->index = val;
+    else if (arg == "--build") cfg->build = val;
     else if (arg == "--ef") cfg->ef = std::strtoul(val, 0, 10);
     else if (arg == "--metric") { if (!starry::parse_metric(val, &cfg->metric)) { std::cerr << "unknown metric: " << val << "\n"; return false; } }
     else { std::cerr << "unknown flag: " << arg << "\n"; return false; }
   }
   return cfg->dim > 0 && cfg->n > 0 && cfg->k > 0 && cfg->queries > 0 &&
-         cfg->threads > 0 && (cfg->index == "flat" || cfg->index == "hnsw");
+         cfg->threads > 0 && (cfg->index == "flat" || cfg->index == "hnsw") &&
+         (cfg->build == "serial" || cfg->build == "bulk");
 }
 
 }  // namespace
@@ -115,8 +124,9 @@ int main(int argc, char** argv) {
   Config cfg;
   if (!parse_args(argc, argv, &cfg)) {
     std::cerr << "usage: starry_bench [--dim N] [--n N] [--k N] "
-                 "[--metric l2|ip|cosine] [--queries N] [--threads N] "
-                 "[--seed N]\n";
+                 "[--metric l2|ip|cosine] [--index flat|hnsw] "
+                 "[--build serial|bulk] [--ef N] [--queries N] "
+                 "[--threads N] [--seed N]\n";
     return 1;
   }
 
@@ -133,18 +143,35 @@ int main(int argc, char** argv) {
   db.set_search_ef(cfg.ef);
 
   // -- build phase ---------------------------------------------------------
-  std::cerr << "[bench] building " << cfg.index
-            << " index: n=" << cfg.n << " dim=" << cfg.dim
+  std::cerr << "[bench] building " << cfg.index << " index (" << cfg.build
+            << "): n=" << cfg.n << " dim=" << cfg.dim
             << " metric=" << starry::metric_name(cfg.metric) << "\n";
-  std::vector<float> buf(cfg.dim);
   const Clock::time_point build_t0 = Clock::now();
-  for (std::size_t i = 0; i < cfg.n; ++i) {
-    for (std::size_t j = 0; j < cfg.dim; ++j) {
-      buf[j] = uniform(rng);
+  if (cfg.build == "bulk") {
+    // Pregenerate the whole dataset (same generator order as the serial
+    // path, so both modes compare identical data), then one bulk call.
+    std::vector<float> data(cfg.n * cfg.dim);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+      data[i] = uniform(rng);
     }
-    if (db.insert(static_cast<starry::id_t>(i), &buf[0]) != starry::kOk) {
-      std::cerr << "insert failed at " << i << "\n";
+    std::vector<starry::id_t> ids(cfg.n);
+    for (std::size_t i = 0; i < cfg.n; ++i) {
+      ids[i] = static_cast<starry::id_t>(i);
+    }
+    if (db.insert_bulk(ids, data, cfg.threads) != starry::kOk) {
+      std::cerr << "insert_bulk failed\n";
       return 1;
+    }
+  } else {
+    std::vector<float> buf(cfg.dim);
+    for (std::size_t i = 0; i < cfg.n; ++i) {
+      for (std::size_t j = 0; j < cfg.dim; ++j) {
+        buf[j] = uniform(rng);
+      }
+      if (db.insert(static_cast<starry::id_t>(i), &buf[0]) != starry::kOk) {
+        std::cerr << "insert failed at " << i << "\n";
+        return 1;
+      }
     }
   }
   const Clock::time_point build_t1 = Clock::now();
@@ -259,6 +286,7 @@ int main(int argc, char** argv) {
   std::cout << "    \"threads\": " << cfg.threads << ",\n";
   std::cout << "    \"seed\": " << cfg.seed << ",\n";
   std::cout << "    \"index\": \"" << cfg.index << "\",\n";
+  std::cout << "    \"build\": \"" << cfg.build << "\",\n";
   std::cout << "    \"ef\": " << db.search_ef() << "\n";
   std::cout << "  },\n";
   std::cout << "  \"build\": {\n";
