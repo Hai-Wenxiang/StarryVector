@@ -6,6 +6,13 @@
 // It is exact - recall is 100% by construction - and doubles as the ground
 // truth generator for future approximate indexes (HNSW, IVF).
 //
+// Cosine metric: vectors are L2-normalised once on add() and the query is
+// normalised once per search(); the scan then reduces to plain inner
+// products (cosine distance = 1 - dot of unit vectors), which halves the
+// per-row arithmetic compared to computing both norms every time.  Zero
+// vectors are stored unchanged and naturally keep the "distance 1"
+// convention of the reference kernel.
+//
 // Memory layout: row-major, vector i occupies [i * dim, (i+1) * dim).
 // Contiguity is kept so that a later SIMD kernel or an mmap'd file can be
 // handed the raw buffer pointer directly, with zero deserialisation.
@@ -28,9 +35,10 @@ class FlatIndex {
   FlatIndex(std::size_t dim, Metric metric);
 
   // Appends one vector.  The pointed-to memory is COPIED into internal
-  // storage, so the caller may reuse or free its buffer afterwards.
-  // The caller is responsible for id uniqueness (VectorDB enforces it);
-  // the index itself accepts anything to stay a dumb, fast container.
+  // storage (L2-normalised first when the metric is cosine), so the caller
+  // may reuse or free its buffer afterwards.  The caller is responsible
+  // for id uniqueness (VectorDB enforces it); the index itself accepts
+  // anything to stay a dumb, fast container.
   void add(id_t id, const float* vec);
 
   // Number of stored vectors (including ones the caller may consider
@@ -41,12 +49,17 @@ class FlatIndex {
   // Vector dimensionality.
   std::size_t dim() const { return dim_; }
 
+  // Comparison metric of this index (needed by indexes layered on top,
+  // e.g. HnswIndex, to resolve their own distance kernel).
+  Metric metric() const { return metric_; }
+
   // Read-only access to the parallel id array (ids()[i] belongs to the
   // vector at row i).  Used by VectorDB for persistence.
   const std::vector<id_t>& ids() const { return ids_; }
 
   // Read-only access to the raw row-major vector storage.  The pointer
-  // stays valid until the next add() / destruction.
+  // stays valid until the next add() / destruction.  With the cosine
+  // metric the rows are stored normalised.
   const std::vector<float>& storage() const { return storage_; }
 
   // Exact k-nearest-neighbour search.
@@ -64,10 +77,12 @@ class FlatIndex {
                                    const std::unordered_set<id_t>* skip) const;
 
  private:
-  const std::size_t dim_;   // fixed dimensionality
-  const DistanceFn dist_;   // resolved metric kernel (never null)
-  std::vector<float> storage_;  // size = size() * dim_, row-major
-  std::vector<id_t> ids_;       // storage row -> caller id
+  const std::size_t dim_;        // fixed dimensionality
+  const Metric metric_;          // metric handed out by metric()
+  const DistanceFn dist_;        // resolved scan kernel (never null)
+  const bool cosine_pre_;        // metric == kCosine: pre-normalised rows
+  std::vector<float> storage_;   // size = size() * dim_, row-major
+  std::vector<id_t> ids_;        // storage row -> caller id
 };
 
 }  // namespace starry

@@ -1,11 +1,17 @@
-// StarryVector - scalar distance kernels.
+// StarryVector - distance kernels.
 //
-// These are deliberately the most primitive implementations possible:
-// plain loops over the components, no SIMD, no blocking, no unrolling.
-// Rationale: this milestone (M0) is the correctness foundation of the
-// whole engine.  Optimised kernels (SSE/AVX2/AVX-512 with runtime CPU
-// dispatch) will be validated AGAINST these reference implementations,
-// so clarity beats cleverness here.
+// Two families of kernels live side by side:
+//
+//   * the scalar reference implementations below - deliberately the most
+//     primitive loops possible.  They are the correctness foundation of
+//     the whole engine and the oracle every optimised kernel is validated
+//     against, so clarity beats cleverness here;
+//   * SIMD kernels (AVX2 when the build machine and CPU allow), selected
+//     at RUNTIME by resolve_distance_fn() below - never at compile time,
+//     so one binary stays portable across heterogeneous machines.
+//
+// Setting the environment variable STARRY_FORCE_SCALAR=1 disables SIMD
+// dispatch entirely (debugging, differential testing, baseline runs).
 //
 // Conventions (see also types.hpp):
 //   * a and b point to exactly `dim` consecutive floats.
@@ -38,9 +44,19 @@ float inner_product_distance(const float* a, const float* b, std::size_t dim);
 // treated as distance 1 (orthogonal) to avoid NaNs.
 float cosine_distance(const float* a, const float* b, std::size_t dim);
 
-// Resolves a Metric to its kernel function.  Never returns null for a
-// valid Metric value.
+// Scalar-only resolver: always returns one of the three reference
+// kernels above, regardless of CPU capabilities.
+DistanceFn resolve_distance_fn_scalar(Metric metric);
+
+// Resolves a Metric to its kernel function, dispatching to the best SIMD
+// variant supported by the RUNNING CPU (AVX2 when available) unless
+// STARRY_FORCE_SCALAR=1 is set in the environment.  Never returns null
+// for a valid Metric value.
 DistanceFn resolve_distance_fn(Metric metric);
+
+// True when SIMD kernels were compiled in (informational, for tests and
+// the benchmark banner).
+bool simd_kernels_available();
 
 }  // namespace starry
 

@@ -4,8 +4,7 @@
 // can later be reused by a plain-C compatibility shim without dragging in
 // any C++ machinery.
 //
-// Language baseline: strict C++11.  Do not use features from C++14 or later
-// anywhere in this project (no std::make_unique, no string_view, ...).
+// Language baseline: C++17.
 #ifndef STARRY_TYPES_HPP
 #define STARRY_TYPES_HPP
 
