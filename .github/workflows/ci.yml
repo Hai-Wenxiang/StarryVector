@@ -1,0 +1,87 @@
+# Continuous integration for StarryVector.
+#
+# Jobs:
+#   build-test (matrix) - release build + unit tests on a range of
+#                         compilers; exercises the SIMD dispatch path.
+#   sanitizer           - debug build with ASan + UBSan, tests + a short
+#                         benchmark smoke run.
+#   scalar              - STARRY_DISABLE_SIMD=ON build to keep the pure
+#                         scalar fallback compiling and passing.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-test:
+    name: build-test (${{ matrix.compiler }}, ${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+        build_type: [Release, Debug]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        if: matrix.compiler == 'clang++'
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark smoke (exact)
+        run: ./build/bin/starry_bench --n 20000 --dim 128 --queries 30 --threads 1
+
+      - name: Benchmark smoke (hnsw + recall)
+        run: >
+          ./build/bin/starry_bench --index hnsw --ef 64
+          --dim 16 --n 50000 --queries 50 --threads 1
+
+  sanitizer:
+    name: asan+ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -O1"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark smoke
+        run: ./build/bin/starry_bench --index hnsw --ef 32 --dim 16 --n 20000 --queries 20 --threads 1
+
+  scalar-only:
+    name: scalar-only build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTARRY_DISABLE_SIMD=ON
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure

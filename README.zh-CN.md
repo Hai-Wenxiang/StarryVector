@@ -1,5 +1,7 @@
 # StarryVector
 
+[![CI](https://github.com/Hai-Wenxiang/StarryVector/actions/workflows/ci.yml/badge.svg)](https://github.com/Hai-Wenxiang/StarryVector/actions/workflows/ci.yml)
+
 [English](README.md) | **简体中文**
 
 面向 RAG（检索增强生成）的高性能**向量数据库**，仅支持 **Linux**，使用可移植的 **C++17** 编写（GCC 7+、Clang 5+）。不支持 Windows 平台。
