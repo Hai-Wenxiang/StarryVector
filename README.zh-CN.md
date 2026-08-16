@@ -14,6 +14,9 @@ StarryVector 为高维 embedding 向量提供高效的存储、索引与相似�
 - **一个二进制跑所有 x86 机器** —— SIMD 通过 `__builtin_cpu_supports` 运行时探测，一次编译从老服务器到新桌面都能跑。设置 `STARRY_FORCE_SCALAR=1` 可强制标量路径。
 - **真删除** —— 基于 tombstone 的软删除在两种索引下都生效，删除的行立即从检索结果中消失。
 - **单文件持久化** —— `save()` / `load()`，小端版本化格式（`STARRYV2` 存储 HNSW 图；旧的 `STARRYV1` 平面文件仍可加载）。
+- **可持久化目录模式（WAL）** —— `VectorDB::open(dir, ...)` 附加到数据库目录：每次变更先写入 CRC 校验的预写日志再确认，`checkpoint()` 原子重写快照并截断日志，崩溃恢复按干净前缀重放（`kSyncAlways` 对每条确认写入 fsync）。崩溃语义由 17 场景故障注入套件（`starry_crash_suite`，`ctest` 的一部分）锁定。
+- **并发读** —— `std::shared_mutex` 读写锁：检索与点查可并行，单写者串行变更（TSan 验证）。
+- **mmap 零拷贝恢复** —— 快照加载直接采用映射文件字节（50 MiB 快照加载约快 32 倍）；首次写入时物化视图（写时复制）。
 - **零依赖** —— 核心库只依赖 C++ 标准库。唯一的内置头文件（doctest）仅是开发期测试依赖。
 - **API 简洁** —— 状态码代替异常；全程 RAII。
 
@@ -30,9 +33,9 @@ StarryVector 为高维 embedding 向量提供高效的存储、索引与相似�
 - [x] 核心向量存储与精确 kNN 检索
 - [x] SIMD 距离内核（AVX2 运行时分发，`STARRY_FORCE_SCALAR=1` 可关闭）
 - [x] HNSW 索引
+- [x] WAL + mmap 存储引擎（目录模式、checkpoint、崩溃安全恢复、并发读）
 - [ ] IVF 索引 + k-means 聚类
 - [ ] 元数据过滤
-- [ ] WAL + mmap 存储引擎
 - [ ] HTTP 服务（REST）接口
 - [ ] Python 客户端绑定
 
@@ -112,6 +115,26 @@ for (/* 每个文档切块 */) {
 }
 auto hits = db.search(query_embedding, 10);   // 近似 top-k
 ```
+
+可持久化目录模式（WAL + checkpoint）：
+
+```cpp
+// 新建数据库：显式 schema 会创建目录。
+starry::Status s;
+std::unique_ptr<starry::VectorDB> db =
+    starry::VectorDB::open("./mydb", &s, 768, starry::kCosine,
+                           starry::kHnswIndex);
+db->set_wal_sync(starry::kSyncAlways);  // 每条确认写入都 fsync
+
+db->insert_bulk(ids, vecs);
+db->checkpoint();   // 原子快照重写 + WAL 截断
+
+// 之后任何 open() 都会恢复：快照还原 + WAL 前缀重放。
+// 撕裂尾 / 损坏记录由 CRC 检测并丢弃；
+// 17 场景故障注入套件（starry_crash_suite）锁定此行为。
+```
+
+读端可并发调用 `search()` / `get()`（共享锁）；写端单写者（独占锁）。
 
 ## 基准测试与验证
 

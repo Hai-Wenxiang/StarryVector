@@ -30,6 +30,7 @@ add_library(starry_core STATIC
   src/distance.cpp
   src/flat_index.cpp
   src/hnsw_index.cpp
+  src/wal.cpp
   src/db.cpp)
 
 option(STARRY_DISABLE_SIMD "Do not build SIMD kernels (scalar only)" OFF)
@@ -63,6 +64,12 @@ add_executable(starry_tests tests/test_core.cpp)
 target_include_directories(starry_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/doctest)
 target_link_libraries(starry_tests PRIVATE starry_core Threads::Threads)
 add_test(NAME core COMMAND starry_tests)
+
+# Storage-engine fault-injection suite: run standalone or with scenario
+# numbers (`starry_crash_suite 3 15`); see the header comment inside.
+add_executable(starry_crash_suite tests/crash_suite.cpp)
+target_link_libraries(starry_crash_suite PRIVATE starry_core Threads::Threads)
+add_test(NAME crash_suite COMMAND starry_crash_suite)
 
 # ---------------------------------------------------------------------------
 # Install rules + package export, so downstream projects can consume

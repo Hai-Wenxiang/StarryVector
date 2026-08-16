@@ -14,15 +14,17 @@
 // Error handling: no exceptions for control flow.  Every operation that
 // can fail returns a Status code, in the spirit of LevelDB / SQLite.
 //
-// Concurrency: NOT thread-safe yet.  The benchmark tool serialises writes
-// and only parallelises read-only searches (which are safe concurrently:
-// search never mutates state).  A read-write lock is planned together
-// with the WAL storage layer.
+// Concurrency: readers (search/get/size) may run concurrently with each
+// other; every mutation (insert/remove/insert_bulk/checkpoint/close)
+// takes the exclusive side of a shared_mutex.  Concurrent read-only
+// searches during writes are safe and lock-based (no lock-free paths
+// yet).
 #ifndef STARRY_DB_HPP
 #define STARRY_DB_HPP
 
 #include <cstddef>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,6 +33,7 @@
 #include "starry/flat_index.hpp"
 #include "starry/hnsw_index.hpp"
 #include "starry/types.hpp"
+#include "starry/wal.hpp"
 
 namespace starry {
 
@@ -42,6 +45,8 @@ enum Status {
   kNotFound = 3,         // remove()/get() of an unknown id
   kIoError = 4,          // file could not be opened / read / written
 };
+
+class MappedFile;  // internal: read-only mmap holder (defined in db.cpp)
 
 // Which index backs search().  kFlat is exact brute force; kHnsw keeps a
 // FlatIndex for storage/ground truth plus an HNSW graph for approximate
@@ -59,6 +64,10 @@ class VectorDB {
   // fixed seed => reproducible builds) on top of the flat storage.
   explicit VectorDB(std::size_t dim, Metric metric = kL2,
                     IndexKind kind = kFlatIndex);
+
+  // Out-of-line destructor: the mapped_ member holds an incomplete
+  // type here (see db.cpp for MappedFile).
+  ~VectorDB();
 
   // ---- write path ----------------------------------------------------
 
@@ -116,11 +125,17 @@ class VectorDB {
   bool get(id_t id, std::vector<float>* out) const;
 
   // Number of live (non-deleted) vectors.
-  std::size_t size() const { return row_of_.size(); }
+  std::size_t size() const {
+    std::shared_lock<std::shared_mutex> guard(rw_);
+    return row_of_.size();
+  }
 
   // Total number of rows in the underlying buffer (live + deleted).
   // size() <= capacity() always; the gap is reclaimed by compaction.
-  std::size_t capacity() const { return index_.size(); }
+  std::size_t capacity() const {
+    std::shared_lock<std::shared_mutex> guard(rw_);
+    return index_.size();
+  }
 
   // Vector dimensionality of this database.
   std::size_t dim() const { return dim_; }
@@ -138,8 +153,53 @@ class VectorDB {
   static std::unique_ptr<VectorDB> load(const std::string& path,
                                         Status* status);
 
+  // ---- durable storage: directory-backed databases ------------------------
+  //
+  // open() attaches this process to a database DIRECTORY:
+  //
+  //   <dir>/snapshot.bin   last checkpoint (the save() format, incl. the
+  //                        HNSW graph when kind == kHnswIndex)
+  //   <dir>/wal.log        write-ahead log of post-checkpoint mutations
+  //   <dir>/starry.meta    schema (dim/metric/kind), written at creation
+  //
+  // Every mutation is logged to the WAL before it is applied in memory
+  // (kSyncAlways fsyncs each record before acknowledging it).  Recovery
+  // = snapshot + prefix replay of the WAL: torn or corrupted log tails
+  // are dropped, so the reopened state is always a consistent prefix of
+  // the acknowledged write sequence.
+  //
+  // A FRESH directory needs an explicit schema (dim > 0; metric/kind
+  // default to kL2/kFlatIndex).  Existing directories derive the schema
+  // from starry.meta (or the snapshot header, for pre-meta layouts) and
+  // reject a conflicting explicit schema with kInvalidArgument.
+  static std::unique_ptr<VectorDB> open(const std::string& dir,
+                                        Status* status, std::size_t dim = 0,
+                                        Metric metric = kL2,
+                                        IndexKind kind = kFlatIndex);
+
+  // Atomically rewrites snapshot.bin (tmp file + rename + fsync) and
+  // truncates the WAL.  Only meaningful for directory-backed databases;
+  // a no-op kOk otherwise.
+  Status checkpoint();
+
+  // Flushes the WAL to disk and closes it.  Post-close mutations return
+  // kIoError; reads keep working on the in-memory state.  Idempotent.
+  Status close();
+
+  // Durability policy for acknowledged writes (see WalSync in wal.hpp):
+  //   kSyncAlways       fsync per record before ack - a crash loses
+  //                     nothing that was acknowledged
+  //   kSyncOnCheckpoint OS buffers; ack'd writes may be lost to a machine
+  //                     crash, but recovery still yields a clean prefix
+  //   kSyncOnClose      buffers flushed at close (benchmark mode)
+  void set_wal_sync(WalSync policy);
+  WalSync wal_sync() const { return sync_; }
+
+  // True when this database is backed by a directory (created by open()).
+  bool attached() const { return attached_; }
+
  private:
-  const std::size_t dim_;
+  std::size_t dim_;  // fixed after construction (load/open set it once)
   const Metric metric_;
   IndexKind kind_;  // logically const after construction; load() flips it
                     // from flat to hnsw after restoring the saved graph
@@ -155,6 +215,37 @@ class VectorDB {
   // into deleted_ instead; the row stays in the index buffer.
   std::unordered_map<id_t, std::size_t> row_of_;
   std::unordered_set<id_t> deleted_;
+
+  // ---- storage-engine state (attached databases only) ----------------
+  std::string dir_;              // database directory ("" when detached)
+  WalWriter wal_;                // open iff attached_ && !closed_
+  WalSync sync_ = kSyncOnCheckpoint;
+  bool attached_ = false;
+  bool closed_ = false;
+
+  // Read-only mapping of the snapshot this database was restored from
+  // (open/load zero-copy path).  Must outlive any adopted FlatIndex
+  // view, i.e. the whole database lifetime or the first write -
+  // materialise() - whichever comes first.
+  std::unique_ptr<MappedFile> mapped_;
+
+  // One RW lock for everything: readers take the shared side, mutators
+  // the exclusive side.  dim_/metric_ never change after open and are
+  // read without the lock.
+  mutable std::shared_mutex rw_;
+
+  // Lock-free serializer body; save() wraps it with the read lock,
+  // checkpoint() calls it under its already-held write lock.
+  Status save_body(const std::string& path) const;
+
+  // Restores rows/tombstones/graph from a save() file into THIS (fresh)
+  // object; shared by load() and open().  Returns the failure status.
+  Status restore_from_file(const std::string& path);
+
+  // Applies a WAL record stream (prefix semantics; duplicate inserts and
+  // unknown removes are tolerated - idempotent replay across a crash in
+  // the middle of checkpoint).
+  Status replay_wal();
 };
 
 }  // namespace starry

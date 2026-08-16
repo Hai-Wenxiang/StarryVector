@@ -21,6 +21,7 @@
 #include "starry/distance.hpp"
 #include "starry/flat_index.hpp"
 #include "starry/hnsw_index.hpp"
+#include "starry/wal.hpp"
 
 namespace {
 
@@ -597,5 +598,188 @@ TEST_CASE("hnsw bulk build recall is on par with serial and round-trips") {
   loaded->set_search_ef(128);
   const std::vector<float> query = make_random_vector(dim, 3000);
   CHECK(same_hits(bulk->search(query, 50), loaded->search(query, 50)));
+  std::remove(path);
+}
+
+// ---- WAL module ----------------------------------------------------------------
+
+TEST_CASE("wal crc32 matches known vectors") {
+  CHECK(starry::wal_crc32("", 0) == 0x00000000u);
+  CHECK(starry::wal_crc32("a", 1) == 0xE8B7BE43u);
+  CHECK(starry::wal_crc32("abc", 3) == 0x352441C2u);
+  CHECK(starry::wal_crc32("123456789", 9) == 0xCBF43926u);
+}
+
+TEST_CASE("wal round-trips insert/remove/bulk records") {
+  const char* path = "/tmp/starry_test_wal.log";
+  std::remove(path);
+
+  starry::WalWriter w;
+  REQUIRE(w.open(path));
+
+  const float v1[] = {1.0f, 2.0f, 3.0f};
+  const std::uint64_t id7 = 7;
+  REQUIRE(w.append(starry::kWalInsert, &id7, 1, v1, 3));
+  REQUIRE(w.append(starry::kWalRemove, &id7, 1, 0, 0));
+  const std::uint64_t bulk_ids[] = {1, 2, 3};
+  const float bulk_vecs[] = {0.5f, -0.5f, 0.25f, -0.25f, 0.125f, -0.125f};
+  REQUIRE(w.append(starry::kWalBulk, bulk_ids, 3, bulk_vecs, 6));
+  REQUIRE(w.sync(starry::kSyncAlways));
+  w.close();
+
+  starry::WalReader r;
+  REQUIRE(r.open(path));
+  starry::WalReader::Record rec;
+  REQUIRE(r.next(&rec));
+  CHECK(rec.op == starry::kWalInsert);
+  CHECK(rec.count == 1);
+  CHECK(rec.ids[0] == 7);
+  CHECK(rec.vec_floats == 3);
+  CHECK(rec.vecs[2] == doctest::Approx(3.0f));
+  REQUIRE(r.next(&rec));
+  CHECK(rec.op == starry::kWalRemove);
+  CHECK(rec.vecs == 0);
+  REQUIRE(r.next(&rec));
+  CHECK(rec.op == starry::kWalBulk);
+  CHECK(rec.count == 3);
+  CHECK(rec.ids[2] == 3);
+  CHECK(rec.vec_floats == 6);
+  CHECK_FALSE(r.next(&rec));  // EOF
+  CHECK_FALSE(r.next(&rec));  // stays at EOF
+  r.close();
+  std::remove(path);
+}
+
+TEST_CASE("wal replay stops at torn tail and bad crc") {
+  const char* path = "/tmp/starry_test_waltorn.log";
+
+  // Baseline: 3 valid records.
+  {
+    starry::WalWriter w;
+    REQUIRE(w.open(path));
+    for (int i = 0; i < 3; ++i) {
+      const float v = static_cast<float>(i);
+      const std::uint64_t id = static_cast<std::uint64_t>(i);
+      REQUIRE(w.append(starry::kWalInsert, &id, 1, &v, 1));
+    }
+    w.close();
+  }
+
+  // Torn tail: append a partial frame (6 of 8 header bytes + junk).
+  {
+    FILE* f = std::fopen(path, "ab");
+    REQUIRE(f != 0);
+    std::fputs("\x40\x00\x00\x00\xAB", f);  // claims 64B payload, cut short
+    std::fclose(f);
+  }
+  {
+    starry::WalReader r;
+    REQUIRE(r.open(path));
+    starry::WalReader::Record rec;
+    int good = 0;
+    while (r.next(&rec)) ++good;
+    CHECK(good == 3);  // prefix only
+    CHECK(r.valid_bytes() > 0);
+    r.close();
+  }
+
+  // Corrupt the second record's CRC: only the first record survives.
+  {
+    starry::WalReader r;
+    REQUIRE(r.open(path));
+    starry::WalReader::Record rec;
+    REQUIRE(r.next(&rec));
+    const std::size_t first_end = r.valid_bytes();
+    r.close();
+    FILE* f = std::fopen(path, "r+b");
+    REQUIRE(f != 0);
+    // Flip a byte inside record #2's payload (just past record #1).
+    std::fseek(f, static_cast<long>(first_end + 10), SEEK_SET);
+    const int c = std::fgetc(f);
+    std::fseek(f, static_cast<long>(first_end + 10), SEEK_SET);
+    std::fputc(c ^ 0x55, f);
+    std::fclose(f);
+  }
+  {
+    starry::WalReader r;
+    REQUIRE(r.open(path));
+    starry::WalReader::Record rec;
+    int good = 0;
+    while (r.next(&rec)) ++good;
+    CHECK(good == 1);  // stopped before the corrupted record
+    r.close();
+  }
+  std::remove(path);
+}
+
+TEST_CASE("wal truncate resets the log") {
+  const char* path = "/tmp/starry_test_waltrunc.log";
+  std::remove(path);
+  starry::WalWriter w;
+  REQUIRE(w.open(path));
+  const float v = 1.0f;
+  std::uint64_t id = 1;
+  REQUIRE(w.append(starry::kWalInsert, &id, 1, &v, 1));
+  REQUIRE(w.truncate());
+  id = 2;
+  REQUIRE(w.append(starry::kWalInsert, &id, 1, &v, 1));
+  w.close();
+
+  starry::WalReader r;
+  REQUIRE(r.open(path));
+  starry::WalReader::Record rec;
+  REQUIRE(r.next(&rec));
+  CHECK(rec.ids[0] == 2);  // first record is the post-truncate one
+  CHECK_FALSE(r.next(&rec));
+  r.close();
+  std::remove(path);
+}
+
+TEST_CASE("zero-copy load supports copy-on-write continuation") {
+  // save -> load (FlatIndex adopts an mmap view) -> keep writing
+  // (materialise) -> search -> save -> load again: results identical.
+  const std::size_t dim = 8;
+  const std::size_t rows = 100;
+  const char* path = "/tmp/starry_test_cow.bin";
+  std::vector<float> data;
+  {
+    starry::VectorDB db(dim, starry::kCosine);
+    for (std::size_t i = 0; i < rows; ++i) {
+      const std::vector<float> v = make_random_vector(dim, static_cast<std::uint32_t>(i));
+      data.insert(data.end(), v.begin(), v.end());
+      REQUIRE(db.insert(static_cast<starry::id_t>(i), v) == starry::kOk);
+    }
+    REQUIRE(db.save(path) == starry::kOk);
+  }
+  const std::vector<float> q0 = make_random_vector(dim, 111);
+  const std::vector<float> q1 = make_random_vector(dim, 222);
+  std::vector<starry::SearchResult> after_cow;
+  {
+    starry::Status s;
+    std::unique_ptr<starry::VectorDB> db = starry::VectorDB::load(path, &s);
+    REQUIRE(db);
+    REQUIRE(s == starry::kOk);
+    const std::vector<starry::SearchResult> v0 = db->search(q0, 10);
+    REQUIRE(v0.size() == 10);
+    // Write path materialises the adopted view.
+    for (starry::id_t i = 1000; i < 1050; ++i) {
+      const std::vector<float> v = make_random_vector(dim, static_cast<std::uint32_t>(i));
+      REQUIRE(db->insert(i, v) == starry::kOk);
+    }
+    REQUIRE(db->remove(5) == starry::kOk);
+    after_cow = db->search(q1, 15);
+    REQUIRE(after_cow.size() == 15);
+    REQUIRE(db->save(path) == starry::kOk);
+  }
+  {
+    starry::Status s;
+    std::unique_ptr<starry::VectorDB> db = starry::VectorDB::load(path, &s);
+    REQUIRE(db);
+    REQUIRE(s == starry::kOk);
+    CHECK(db->size() == 100 + 50 - 1);
+    CHECK(same_hits(db->search(q1, 15), after_cow));
+    std::vector<float> out;
+    CHECK_FALSE(db->get(5, &out));
+  }
   std::remove(path);
 }

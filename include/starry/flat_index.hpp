@@ -41,10 +41,23 @@ class FlatIndex {
   // anything to stay a dumb, fast container.
   void add(id_t id, const float* vec);
 
+  // Zero-copy adoption: takes an external read-only buffer pair as the
+  // whole index content.  Layout must match the save() file: `storage`
+  // holds n*dim floats row-major (ALREADY cosine-normalised for the
+  // cosine metric - exactly what FlatIndex::add produces and save()
+  // writes), `ids` holds n ids.  The buffers must outlive the index, or
+  // at least until the next add(): the first add() materialises the
+  // view into owned storage first (copy-on-write).  Intended for
+  // mmap-backed recovery; duplicate ids in the view are the caller's
+  // problem (VectorDB::restore detects them).
+  void adopt(const float* storage, const id_t* ids, std::size_t n);
+
   // Number of stored vectors (including ones the caller may consider
   // deleted - deletion is the caller's concern, see the skip parameter
   // of search()).
-  std::size_t size() const { return ids_.size(); }
+  std::size_t size() const {
+    return view_storage_ != 0 ? view_n_ : ids_.size();
+  }
 
   // Vector dimensionality.
   std::size_t dim() const { return dim_; }
@@ -53,14 +66,19 @@ class FlatIndex {
   // e.g. HnswIndex, to resolve their own distance kernel).
   Metric metric() const { return metric_; }
 
-  // Read-only access to the parallel id array (ids()[i] belongs to the
-  // vector at row i).  Used by VectorDB for persistence.
-  const std::vector<id_t>& ids() const { return ids_; }
+  // Raw row-major storage pointer (owned buffer or the adopted view).
+  // Null when the index is empty.  Valid until the next add().
+  const float* data() const {
+    return view_storage_ != 0 ? view_storage_
+                              : (storage_.empty() ? 0 : &storage_[0]);
+  }
 
-  // Read-only access to the raw row-major vector storage.  The pointer
-  // stays valid until the next add() / destruction.  With the cosine
-  // metric the rows are stored normalised.
-  const std::vector<float>& storage() const { return storage_; }
+  // Parallel id array (owned buffer or the adopted view); ids_data()[i]
+  // belongs to the vector at row i.  Null when empty.  Valid until the
+  // next add().
+  const id_t* ids_data() const {
+    return view_ids_ != 0 ? view_ids_ : (ids_.empty() ? 0 : &ids_[0]);
+  }
 
   // Exact k-nearest-neighbour search.
   //
@@ -83,6 +101,16 @@ class FlatIndex {
   const bool cosine_pre_;        // metric == kCosine: pre-normalised rows
   std::vector<float> storage_;   // size = size() * dim_, row-major
   std::vector<id_t> ids_;        // storage row -> caller id
+
+  // Adopted read-only view (zero-copy recovery).  Non-null view_storage_
+  // means data()/ids_data() serve from here and storage_/ids_ are empty
+  // until the first add() materialises them (copy-on-write).
+  const float* view_storage_ = 0;
+  const id_t* view_ids_ = 0;
+  std::size_t view_n_ = 0;
+
+  // Copy-on-write: turns an adopted view into owned storage.
+  void materialise();
 };
 
 }  // namespace starry
