@@ -46,6 +46,8 @@ enum Status {
   kIoError = 4,          // file could not be opened / read / written
 };
 
+class MappedFile;  // internal: read-only mmap holder (defined in db.cpp)
+
 // Which index backs search().  kFlat is exact brute force; kHnsw keeps a
 // FlatIndex for storage/ground truth plus an HNSW graph for approximate
 // search (recall tunable via the ef search parameter).
@@ -62,6 +64,10 @@ class VectorDB {
   // fixed seed => reproducible builds) on top of the flat storage.
   explicit VectorDB(std::size_t dim, Metric metric = kL2,
                     IndexKind kind = kFlatIndex);
+
+  // Out-of-line destructor: the mapped_ member holds an incomplete
+  // type here (see db.cpp for MappedFile).
+  ~VectorDB();
 
   // ---- write path ----------------------------------------------------
 
@@ -216,6 +222,12 @@ class VectorDB {
   WalSync sync_ = kSyncOnCheckpoint;
   bool attached_ = false;
   bool closed_ = false;
+
+  // Read-only mapping of the snapshot this database was restored from
+  // (open/load zero-copy path).  Must outlive any adopted FlatIndex
+  // view, i.e. the whole database lifetime or the first write -
+  // materialise() - whichever comes first.
+  std::unique_ptr<MappedFile> mapped_;
 
   // One RW lock for everything: readers take the shared side, mutators
   // the exclusive side.  dim_/metric_ never change after open and are

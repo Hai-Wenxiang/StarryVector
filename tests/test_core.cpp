@@ -734,3 +734,52 @@ TEST_CASE("wal truncate resets the log") {
   r.close();
   std::remove(path);
 }
+
+TEST_CASE("zero-copy load supports copy-on-write continuation") {
+  // save -> load (FlatIndex adopts an mmap view) -> keep writing
+  // (materialise) -> search -> save -> load again: results identical.
+  const std::size_t dim = 8;
+  const std::size_t rows = 100;
+  const char* path = "/tmp/starry_test_cow.bin";
+  std::vector<float> data;
+  {
+    starry::VectorDB db(dim, starry::kCosine);
+    for (std::size_t i = 0; i < rows; ++i) {
+      const std::vector<float> v = make_random_vector(dim, static_cast<std::uint32_t>(i));
+      data.insert(data.end(), v.begin(), v.end());
+      REQUIRE(db.insert(static_cast<starry::id_t>(i), v) == starry::kOk);
+    }
+    REQUIRE(db.save(path) == starry::kOk);
+  }
+  const std::vector<float> q0 = make_random_vector(dim, 111);
+  const std::vector<float> q1 = make_random_vector(dim, 222);
+  std::vector<starry::SearchResult> after_cow;
+  {
+    starry::Status s;
+    std::unique_ptr<starry::VectorDB> db = starry::VectorDB::load(path, &s);
+    REQUIRE(db);
+    REQUIRE(s == starry::kOk);
+    const std::vector<starry::SearchResult> v0 = db->search(q0, 10);
+    REQUIRE(v0.size() == 10);
+    // Write path materialises the adopted view.
+    for (starry::id_t i = 1000; i < 1050; ++i) {
+      const std::vector<float> v = make_random_vector(dim, static_cast<std::uint32_t>(i));
+      REQUIRE(db->insert(i, v) == starry::kOk);
+    }
+    REQUIRE(db->remove(5) == starry::kOk);
+    after_cow = db->search(q1, 15);
+    REQUIRE(after_cow.size() == 15);
+    REQUIRE(db->save(path) == starry::kOk);
+  }
+  {
+    starry::Status s;
+    std::unique_ptr<starry::VectorDB> db = starry::VectorDB::load(path, &s);
+    REQUIRE(db);
+    REQUIRE(s == starry::kOk);
+    CHECK(db->size() == 100 + 50 - 1);
+    CHECK(same_hits(db->search(q1, 15), after_cow));
+    std::vector<float> out;
+    CHECK_FALSE(db->get(5, &out));
+  }
+  std::remove(path);
+}

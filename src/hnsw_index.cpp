@@ -64,15 +64,15 @@ HnswIndex::HnswIndex(const FlatIndex& base, std::size_t M,
       level_rng_(seed) {}
 
 float HnswIndex::row_dist(const float* query, std::size_t row) const {
-  // Re-fetch the row on every call: the base buffer may reallocate while
-  // the index is being built, so no pointer may be cached across calls.
-  const std::vector<float>& storage = base_.storage();
-  return dist_(query, &storage[row * dim_], dim_);
+  // Re-fetch on every call: the base buffer may reallocate (vector
+  // growth) or materialise (copy-on-write off an mmap view) while the
+  // index is being built, so no pointer may be cached across calls.
+  return dist_(query, base_.data() + row * dim_, dim_);
 }
 
 float HnswIndex::row_row_dist(std::size_t a, std::size_t b) const {
-  const std::vector<float>& storage = base_.storage();
-  return dist_(&storage[a * dim_], &storage[b * dim_], dim_);
+  const float* rows = base_.data();
+  return dist_(rows + a * dim_, rows + b * dim_, dim_);
 }
 
 std::int32_t HnswIndex::draw_level() {
@@ -90,12 +90,12 @@ void HnswIndex::select_heuristic(const float* q,
   out->clear();
   for (std::size_t ci = 0; ci < cands.size() && out->size() < M; ++ci) {
     const std::int32_t c = cands[ci];
-    const float* cv = &base_.storage()[static_cast<std::size_t>(c) * dim_];
+    const float* cv = base_.data() + static_cast<std::size_t>(c) * dim_;
     bool keep = true;
     for (std::size_t oi = 0; oi < out->size(); ++oi) {
       const std::int32_t o = (*out)[oi];
       const float* ov =
-          &base_.storage()[static_cast<std::size_t>(o) * dim_];
+          base_.data() + static_cast<std::size_t>(o) * dim_;
       // If c is closer to an already-kept neighbour than to q, adding it
       // would not diversify the neighbourhood - drop it.
       if (dist_(cv, ov, dim_) < dist_(cv, q, dim_)) {
@@ -120,7 +120,7 @@ void HnswIndex::search_layer(
   std::priority_queue<Hit, std::vector<Hit>, Nearer> candidates;  // top: nearest
   std::priority_queue<Hit, std::vector<Hit>, Farther> frontier;   // top: farthest
 
-  const std::vector<id_t>& ids = base_.ids();
+  const id_t* ids = base_.ids_data();
 
   for (std::size_t i = 0; i < entries.size(); ++i) {
     const std::int32_t e = entries[i];
@@ -201,8 +201,7 @@ void HnswIndex::add_row(std::size_t row) {
   node.level = level;
   node.links.resize(static_cast<std::size_t>(level) + 1);
 
-  const std::vector<float>& storage = base_.storage();
-  const float* q = &storage[row * dim_];
+  const float* q = base_.data() + row * dim_;
 
   if (entry_ < 0) {
     // First node: becomes the entry point of every layer up to `level`.
@@ -270,7 +269,7 @@ void HnswIndex::add_row(std::size_t row) {
         // Re-pick the best `cap` of the merged list around node n.
         std::vector<std::int32_t> merged = nl;
         const float* nv =
-            &base_.storage()[static_cast<std::size_t>(n) * dim_];
+            base_.data() + static_cast<std::size_t>(n) * dim_;
         std::sort(merged.begin(), merged.end(),
                   [&](std::int32_t a, std::int32_t b) {
                     return row_row_dist(static_cast<std::size_t>(a),
@@ -317,8 +316,7 @@ void HnswIndex::plan_row(std::size_t row, std::size_t efc,
     return;  // empty graph: link_row() handles the entry bootstrap
   }
 
-  const std::vector<float>& storage = base_.storage();
-  const float* q = &storage[row * dim_];
+  const float* q = base_.data() + row * dim_;
 
   // Greedy descent with ef = 1 from the top layer to level+1 (the
   // graph state here is frozen, so this is read-only).
@@ -384,8 +382,7 @@ void HnswIndex::link_row(std::size_t row, const BulkPlan& plan) {
     return;
   }
 
-  const std::vector<float>& storage = base_.storage();
-  const float* q = &storage[row * dim_];
+  const float* q = base_.data() + row * dim_;
 
   // Layers above frozen_max_level have no candidates (the frozen prefix
   // did not reach them); their link lists stay empty and the node is
@@ -408,7 +405,7 @@ void HnswIndex::link_row(std::size_t row, const BulkPlan& plan) {
       if (nl.size() > cap) {
         std::vector<std::int32_t> merged = nl;
         const float* nv =
-            &base_.storage()[static_cast<std::size_t>(n) * dim_];
+            base_.data() + static_cast<std::size_t>(n) * dim_;
         std::sort(merged.begin(), merged.end(),
                   [&](std::int32_t a, std::int32_t b) {
                     return row_row_dist(static_cast<std::size_t>(a),
@@ -537,7 +534,7 @@ std::vector<SearchResult> HnswIndex::search(
   std::vector<std::int32_t> entries(1, cur);
   search_layer(query, ef, entries, skip, &hits, 0);
 
-  const std::vector<id_t>& ids = base_.ids();
+  const id_t* ids = base_.ids_data();
   const bool cosine = base_.metric() == kCosine;
   const std::size_t want = std::min(k, hits.size());
   for (std::size_t i = 0; i < want; ++i) {

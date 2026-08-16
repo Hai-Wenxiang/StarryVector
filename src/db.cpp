@@ -42,6 +42,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <mutex>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -192,6 +193,51 @@ bool peek_snapshot_schema(const std::string& path, std::size_t* dim,
 
 }  // namespace
 
+// Read-only whole-file mmap with RAII ( PROT_READ / MAP_PRIVATE ).
+// Declared in db.hpp as an opaque type; the mapping must outlive any
+// FlatIndex view adopted off its bytes.
+class MappedFile {
+ public:
+  ~MappedFile() { close(); }
+
+  bool open_read(const std::string& path) {
+    close();
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      return false;
+    }
+    struct stat st;
+    if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
+      ::close(fd);
+      return false;
+    }
+    size_ = static_cast<std::size_t>(st.st_size);
+    map_ = ::mmap(0, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (map_ == MAP_FAILED) {
+      map_ = 0;
+      return false;
+    }
+    return true;
+  }
+
+  const char* data() const { return static_cast<const char*>(map_); }
+  std::size_t size() const { return size_; }
+
+  void close() {
+    if (map_ != 0) {
+      ::munmap(map_, size_);
+      map_ = 0;
+    }
+    size_ = 0;
+  }
+
+ private:
+  void* map_ = 0;
+  std::size_t size_ = 0;
+};
+
+
 // ---- construction ---------------------------------------------------------
 
 VectorDB::VectorDB(std::size_t dim, Metric metric, IndexKind kind)
@@ -200,6 +246,8 @@ VectorDB::VectorDB(std::size_t dim, Metric metric, IndexKind kind)
     hnsw_.reset(new HnswIndex(index_));
   }
 }
+
+VectorDB::~VectorDB() {}  // members (incl. the MappedFile) unwind here
 
 // ---- write path -----------------------------------------------------------
 
@@ -340,10 +388,9 @@ bool VectorDB::get(id_t id, std::vector<float>* out) const {
   if (it == row_of_.end()) {
     return false;
   }
-  const std::vector<float>& storage = index_.storage();
+  const float* rows = index_.data();
   const std::size_t row = it->second;
-  out->assign(storage.begin() + row * dim_,
-              storage.begin() + (row + 1) * dim_);
+  out->assign(rows + row * dim_, rows + (row + 1) * dim_);
   return true;
 }
 
@@ -375,9 +422,9 @@ Status VectorDB::save_body(const std::string& path) const {
   out.write(header, sizeof(header));
 
   if (n > 0) {
-    out.write(reinterpret_cast<const char*>(index_.storage().data()),
+    out.write(reinterpret_cast<const char*>(index_.data()),
               static_cast<std::streamsize>(n * d * sizeof(float)));
-    out.write(reinterpret_cast<const char*>(index_.ids().data()),
+    out.write(reinterpret_cast<const char*>(index_.ids_data()),
               static_cast<std::streamsize>(n * sizeof(id_t)));
   }
 
@@ -412,103 +459,129 @@ Status VectorDB::save_body(const std::string& path) const {
 // out of load() so open() can reuse it for snapshot recovery; identical
 // logic to the historical loader.
 Status VectorDB::restore_from_file(const std::string& path) {
-  std::ifstream in(path.c_str(), std::ios::binary);
-  if (!in) {
+  // Zero-copy recovery: the snapshot is mmapped and its payload/ids
+  // blocks are adopted by the FlatIndex as a read-only view (see
+  // FlatIndex::adopt).  Only the HNSW graph words (tiny relative to the
+  // payload) are copied.  The mapping is kept for the database's
+  // lifetime - or until the first write materialises the view.
+  MappedFile* mf = new MappedFile();
+  if (!mf->open_read(path)) {
+    delete mf;
+    return kIoError;
+  }
+  const char* p = mf->data();
+  const std::size_t sz = mf->size();
+  if (sz < 32) {
+    delete mf;
     return kIoError;
   }
 
-  char header[32];
-  if (!read_exact(in, header, sizeof(header))) {
-    return kIoError;
+  const bool is_v2 = std::memcmp(p, kMagicV2, 8) == 0;
+  if (!is_v2 && std::memcmp(p, kMagicV1, 8) != 0) {
+    delete mf;
+    return kIoError;  // wrong format
   }
-  const bool is_v2 = std::memcmp(header, kMagicV2, 8) == 0;
-  if (!is_v2 && std::memcmp(header, kMagicV1, 8) != 0) {
-    return kIoError;  // truncated or wrong format
-  }
-  const std::uint32_t metric_raw = get_u32(header + 8);
+  const std::uint32_t metric_raw = get_u32(p + 8);
   if (metric_raw != static_cast<std::uint32_t>(metric_)) {
+    delete mf;
     return kIoError;  // schema mismatch
   }
-  const std::uint32_t kind_raw = get_u32(header + 12);
+  const std::uint32_t kind_raw = get_u32(p + 12);
   if (kind_raw > kHnswIndex) {
+    delete mf;
     return kIoError;  // unknown index kind
   }
-  // A V1 file always wrote zero here, which reads back as kFlatIndex.
   const IndexKind kind = is_v2 ? static_cast<IndexKind>(kind_raw) : kFlatIndex;
-  const std::uint64_t d = get_u64(header + 16);
-  const std::uint64_t n = get_u64(header + 24);
+  const std::uint64_t d = get_u64(p + 16);
+  const std::uint64_t n = get_u64(p + 24);
   if (d != dim_ || n > (1ull << 40)) {
+    delete mf;
     return kIoError;  // dim mismatch or insane count
   }
 
-  // The ids block sits AFTER the payload block (see the format table at
-  // the top of this file), so jump ahead, read it into memory, then seek
-  // back and stream the payloads row by row.  This keeps the peak extra
-  // memory at 8 bytes per row instead of duplicating the payload.
-  std::vector<char> row_ids;
-  row_ids.resize(static_cast<std::size_t>(n) * sizeof(id_t));
-  if (n > 0) {
-    in.seekg(static_cast<std::streamoff>(32 + n * d * sizeof(float)));
-    if (!read_exact(in, &row_ids[0],
-                    static_cast<std::streamsize>(row_ids.size()))) {
-      return kIoError;
-    }
-    in.seekg(static_cast<std::streamoff>(32));
+  // Segment boundaries with overflow-safe checks: the file must hold
+  // header + payload + ids + tombstone count at the very least.
+  const std::uint64_t row_bytes = d * 4 + 8;  // <= 2^26 + 8, no overflow
+  if (n > 0 && row_bytes > 0 &&
+      (n > (sz - 40) / row_bytes)) {
+    delete mf;
+    return kIoError;  // truncated file
   }
-  std::vector<float> buf(static_cast<std::size_t>(d));
-  for (std::uint64_t i = 0; i < n; ++i) {
-    if (!read_exact(in, reinterpret_cast<char*>(&buf[0]),
-                    static_cast<std::streamsize>(buf.size() * sizeof(float)))) {
-      return kIoError;
-    }
-    const id_t id = get_u64(&row_ids[static_cast<std::size_t>(i) * sizeof(id_t)]);
-    if (insert(id, &buf[0]) != kOk) {
-      return kIoError;  // duplicate id: corrupt file
-    }
-  }
-
-  char count8[8];
-  // The payload and id blocks were consumed above; jump past them to
-  // the trailing tombstone section instead of trusting the stream
-  // position (which sits at the start of the id block right now).
-  if (n > 0) {
-    in.seekg(static_cast<std::streamoff>(
-        32 + n * d * sizeof(float) + n * sizeof(id_t)));
-  }
-  if (!read_exact(in, count8, sizeof(count8))) {
+  const std::size_t payload_off = 32;
+  const std::size_t ids_off =
+      payload_off + static_cast<std::size_t>(n) * static_cast<std::size_t>(d) * 4;
+  const std::size_t del_off =
+      ids_off + static_cast<std::size_t>(n) * 8;
+  if (del_off + 8 > sz) {
+    delete mf;
     return kIoError;
   }
-  const std::uint64_t del = get_u64(count8);
-  for (std::uint64_t i = 0; i < del; ++i) {
-    if (!read_exact(in, count8, sizeof(count8))) {
+
+  // Adopt the payload + ids blocks (already cosine-normalised where the
+  // metric demands it - that is exactly what save() wrote).
+  index_.adopt(reinterpret_cast<const float*>(p + payload_off),
+               reinterpret_cast<const id_t*>(p + ids_off),
+               static_cast<std::size_t>(n));
+
+  // Rebuild the live-id map straight off the adopted view; duplicate
+  // ids mean a corrupt snapshot.
+  for (std::uint64_t i = 0; i < n; ++i) {
+    const id_t id = get_u64(p + ids_off + static_cast<std::size_t>(i) * 8);
+    if (!row_of_.emplace(id, static_cast<std::size_t>(i)).second) {
+      delete mf;  // view dies with the mapping; index_ is reset by the
+                  // caller failing the whole open/load anyway
       return kIoError;
     }
-    remove(get_u64(count8));  // already-absent ids in a corrupt file
-                             // are tolerated (kNotFound ignored)
   }
 
+  // Tombstones.
+  const std::uint64_t del = get_u64(p + del_off);
+  if (del_off + 8 + static_cast<std::size_t>(del) * 8 > sz) {
+    delete mf;
+    return kIoError;
+  }
+  for (std::uint64_t i = 0; i < del; ++i) {
+    deleted_.insert(
+        get_u64(p + del_off + 8 + static_cast<std::size_t>(i) * 8));
+  }
+  // Deleted ids that never existed are tolerated (corrupt file), same
+  // as the historical streaming loader did via remove()'s kNotFound.
+  for (std::unordered_set<id_t>::const_iterator it = deleted_.begin();
+       it != deleted_.end(); ++it) {
+    row_of_.erase(*it);
+  }
+
+  // HNSW graph (V2 only): the only block actually copied - word counts
+  // are tiny next to the payload.
   if (kind == kHnswIndex) {
-    std::uint64_t graph_words = 0;
-    if (!read_exact(in, reinterpret_cast<char*>(&graph_words),
-                    sizeof(graph_words)) ||
-        graph_words > (1ull << 32)) {
+    const std::size_t graph_off = del_off + 8 + static_cast<std::size_t>(del) * 8;
+    if (graph_off + 8 > sz) {
+      delete mf;
       return kIoError;
     }
-    std::vector<std::uint64_t> graph(static_cast<std::size_t>(graph_words));
-    if (graph_words > 0 &&
-        !read_exact(in, reinterpret_cast<char*>(graph.data()),
-                    static_cast<std::streamsize>(graph.size() * 8))) {
+    const std::uint64_t graph_words = get_u64(p + graph_off);
+    if (graph_words > (1ull << 32) ||
+        graph_off + 8 + static_cast<std::size_t>(graph_words) * 8 > sz) {
+      delete mf;
       return kIoError;
     }
-    // Switch the live database over to the HNSW kind and restore the
-    // saved graph on top of the freshly loaded rows.
-    kind_ = kHnswIndex;
-    hnsw_.reset(new HnswIndex(index_));
+    std::vector<std::uint64_t> graph(
+        reinterpret_cast<const std::uint64_t*>(p + graph_off + 8),
+        reinterpret_cast<const std::uint64_t*>(p + graph_off + 8) +
+            static_cast<std::size_t>(graph_words));
+    if (hnsw_ == 0) {
+      kind_ = kHnswIndex;
+      hnsw_.reset(new HnswIndex(index_));
+    }
     if (!hnsw_->deserialize(graph.empty() ? 0 : &graph[0], graph.size(),
                             static_cast<std::size_t>(n))) {
+      delete mf;
       return kIoError;
     }
   }
+
+  // Success: the mapping (and the adopted view) belongs to this object.
+  mapped_.reset(mf);
   return kOk;
 }
 

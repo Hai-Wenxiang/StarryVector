@@ -47,7 +47,34 @@ FlatIndex::FlatIndex(std::size_t dim, Metric metric)
   // good enough for bulk loads of a few million vectors.
 }
 
+void FlatIndex::materialise() {
+  if (view_storage_ == 0) {
+    return;
+  }
+  storage_.assign(view_storage_, view_storage_ + view_n_ * dim_);
+  ids_.assign(view_ids_, view_ids_ + view_n_);
+  view_storage_ = 0;
+  view_ids_ = 0;
+  view_n_ = 0;
+}
+
+void FlatIndex::adopt(const float* storage, const id_t* ids,
+                      std::size_t n) {
+  // Adopting replaces ALL content; a prior adopted view is simply
+  // dropped (its owner - the MappedFile in VectorDB - keeps the bytes
+  // alive independently).
+  storage_.clear();
+  storage_.shrink_to_fit();
+  ids_.clear();
+  ids_.shrink_to_fit();
+  view_storage_ = storage;
+  view_ids_ = ids;
+  view_n_ = n;
+}
+
 void FlatIndex::add(id_t id, const float* vec) {
+  // First write after a zero-copy adopt pays one full copy here.
+  materialise();
   // Bulk append of one row keeps the buffer contiguous (and therefore
   // prefetcher-friendly even in this scalar version).
   storage_.insert(storage_.end(), vec, vec + dim_);
@@ -75,10 +102,12 @@ std::vector<SearchResult> FlatIndex::search(
     q = &query_scratch[0];
   }
 
-  const std::size_t n = ids_.size();
+  const std::size_t n = ids_.size() + view_n_;  // == size()
+  const float* rows = data();
+  const id_t* ids = ids_data();
   float worst = 0.0f;  // distance of the current k-th best (heap top)
   for (std::size_t i = 0; i < n; ++i) {
-    float d = dist_(q, &storage_[i * dim_], dim_);
+    float d = dist_(q, rows + i * dim_, dim_);
     if (cosine_pre_) {
       // ip kernel returned -dot; unit vectors: cosine distance = 1 - dot.
       d += 1.0f;
@@ -91,12 +120,12 @@ std::vector<SearchResult> FlatIndex::search(
       continue;
     }
     // Second rejection: soft-deleted ids pretend not to exist.
-    if (skip != 0 && skip->find(ids_[i]) != skip->end()) {
+    if (skip != 0 && skip->find(ids[i]) != skip->end()) {
       continue;
     }
 
     SearchResult hit;
-    hit.id = ids_[i];
+    hit.id = ids[i];
     hit.distance = d;
     if (best.size() < k) {
       best.push_back(hit);

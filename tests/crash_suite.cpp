@@ -773,6 +773,77 @@ void s16_wal_fuzz() {
   rm_rf(dir);
 }
 
+
+// S17: HNSW + checkpoint: recovery goes through the SNAPSHOT (mmap
+// adopt + graph deserialize), not the WAL; then COW writes on top of
+// the adopted view keep working and re-checkpoint.
+void s17_hnsw_checkpoint_snapshot_path() {
+  const std::string dir = temp_dir("s17");
+  rm_rf(dir);
+  const std::size_t dim = 16;
+  const std::size_t rows = 1500;
+  const std::vector<float> q = det_vector(dim, 777);
+  std::vector<starry::SearchResult> before;
+  {
+    starry::Status s;
+    starry::VectorDB* db = open_db(dir, &s, dim, starry::kL2,
+                                   starry::kHnswIndex);
+    require_ok(s, "open hnsw");
+    db->set_search_ef(128);
+    std::vector<starry::id_t> ids(rows);
+    std::vector<float> vecs;
+    for (std::size_t i = 0; i < rows; ++i) {
+      ids[i] = static_cast<starry::id_t>(i);
+      const std::vector<float> v = det_vector(dim, static_cast<unsigned>(i));
+      vecs.insert(vecs.end(), v.begin(), v.end());
+    }
+    require_ok(db->insert_bulk(ids, vecs, 4), "bulk build");
+    before = db->search(q, 10);
+    CHECK(before.size() == 10);
+    require_ok(db->checkpoint(), "checkpoint");
+    delete db;  // crash after checkpoint
+  }
+  {
+    starry::Status s;
+    starry::VectorDB* db = reopen_db(dir, &s);
+    require_ok(s, "reopen from snapshot");
+    CHECK(db->kind() == starry::kHnswIndex);
+    CHECK(db->size() == rows);
+    db->set_search_ef(128);
+    // Same answers as before the crash (graph restored bit-identically).
+    const std::vector<starry::SearchResult> after = db->search(q, 10);
+    CHECK(after.size() == before.size());
+    for (std::size_t i = 0; i < before.size() && i < after.size(); ++i) {
+      CHECK(before[i].id == after[i].id);
+      CHECK(std::fabs(before[i].distance - after[i].distance) < 1e-4f);
+    }
+    // COW on top of the adopted view: keep writing, checkpoint, reopen.
+    for (int i = 5000; i < 5100; ++i) {
+      require_ok(db->insert(static_cast<starry::id_t>(i),
+                            det_vector(dim, static_cast<unsigned>(i))),
+                 "cow insert");
+    }
+    require_ok(db->remove(3), "cow remove");
+    require_ok(db->checkpoint(), "cow checkpoint");
+    require_ok(db->close(), "close");
+    delete db;
+  }
+  {
+    starry::Status s;
+    starry::VectorDB* db = reopen_db(dir, &s);
+    require_ok(s, "reopen after cow checkpoint");
+    CHECK(db->size() == rows + 100 - 1);
+    std::vector<float> out;
+    CHECK_FALSE(db->get(3, &out));
+    CHECK(db->get(5050, &out));
+    db->set_search_ef(128);
+    CHECK(db->search(q, 10).size() == 10);
+    require_ok(db->close(), "close");
+    delete db;
+  }
+  rm_rf(dir);
+}
+
 const Scenario kScenarios[] = {
     {"s01_create_write_close_reopen", s01_create_write_close_reopen},
     {"s02_wal_tail_torn", s02_wal_tail_torn},
@@ -790,6 +861,7 @@ const Scenario kScenarios[] = {
     {"s14_checkpoint_shrinks_wal", s14_checkpoint_shrinks_wal},
     {"s15_concurrent_readers_writer", s15_concurrent_readers_writer},
     {"s16_wal_fuzz", s16_wal_fuzz},
+    {"s17_hnsw_checkpoint_snapshot_path", s17_hnsw_checkpoint_snapshot_path},
 };
 
 }  // namespace
