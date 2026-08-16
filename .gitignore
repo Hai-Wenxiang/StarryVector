@@ -1,0 +1,23 @@
+# Build
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Compiled artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+.cache/
+clangd/
+
+# System
+.DS_Store
+*.log
