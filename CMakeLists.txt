@@ -17,12 +17,24 @@ find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Core library: zero third-party dependencies by design.
+#
+# distance_avx2.cpp is compiled with -mavx2 -mfma on x86 only; the kernels
+# are gated at runtime by __builtin_cpu_supports (see src/distance.cpp), so
+# the resulting binary still runs on CPUs without AVX2.
 # ---------------------------------------------------------------------------
 add_library(starry_core STATIC
   src/types.cpp
   src/distance.cpp
   src/flat_index.cpp
   src/db.cpp)
+
+option(STARRY_DISABLE_SIMD "Do not build SIMD kernels (scalar only)" OFF)
+if(NOT STARRY_DISABLE_SIMD AND (CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)"))
+  target_sources(starry_core PRIVATE src/distance_avx2.cpp)
+  set_source_files_properties(src/distance_avx2.cpp PROPERTIES
+    COMPILE_OPTIONS "-mavx2;-mfma")
+  target_compile_definitions(starry_core PRIVATE STARRY_HAVE_AVX2=1)
+endif()
 target_include_directories(starry_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ---------------------------------------------------------------------------

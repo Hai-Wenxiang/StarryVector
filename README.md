@@ -6,7 +6,7 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 
 ## Features
 
-- **Exact Search (available now)** — brute-force kNN with scalar distance kernels (L2, inner product, cosine), 100% recall by construction. Cosine vectors are L2-normalised on insert so searches reduce to inner products (~2x faster).
+- **Exact Search (available now)** — brute-force kNN with SIMD distance kernels (AVX2 with runtime CPU dispatch and a scalar fallback; L2, inner product, cosine), 100% recall by construction. Cosine vectors are L2-normalised on insert so searches reduce to inner products (~2x faster on top of SIMD).
 - **Persistence** — single-file `save()` / `load()` with tombstone-aware soft deletion
 - **ANN Indexes** (planned) — HNSW graph index and IVF with quantization, validated against the exact core
 - **Metadata Filtering** (planned) — combine vector search with scalar attribute filters
@@ -15,7 +15,7 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 ## Roadmap
 
 - [x] Core vector storage & exact kNN search
-- [ ] SIMD distance kernels
+- [x] SIMD distance kernels (AVX2, runtime dispatch, `STARRY_FORCE_SCALAR=1` to disable)
 - [ ] HNSW index
 - [ ] IVF index with k-means clustering
 - [ ] Metadata filtering

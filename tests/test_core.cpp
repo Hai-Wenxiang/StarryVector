@@ -84,6 +84,37 @@ bool same_hits(const std::vector<starry::SearchResult>& a,
 
 // ---- distance kernels ------------------------------------------------------
 
+TEST_CASE("simd kernels match the scalar oracle within tolerance") {
+  if (!starry::simd_kernels_available()) {
+    return;
+  }
+  // Odd sizes exercise the scalar tail; 32/8 multiples exercise the
+  // unrolled and 8-wide main loops of the AVX2 kernels.
+  const std::size_t dims[] = {1, 7, 8, 31, 32, 33, 64, 127, 1024};
+  for (std::size_t di = 0; di < sizeof(dims) / sizeof(dims[0]); ++di) {
+    const std::size_t dim = dims[di];
+    const std::vector<float> a = make_random_vector(dim, 11);
+    const std::vector<float> b = make_random_vector(dim, 12);
+
+    const starry::DistanceFn l2_fast = starry::resolve_distance_fn(starry::kL2);
+    const starry::DistanceFn ip_fast =
+        starry::resolve_distance_fn(starry::kInnerProduct);
+    const starry::DistanceFn l2_ref =
+        starry::resolve_distance_fn_scalar(starry::kL2);
+    const starry::DistanceFn ip_ref =
+        starry::resolve_distance_fn_scalar(starry::kInnerProduct);
+
+    const float e_l2 = std::fabs(l2_fast(&a[0], &b[0], dim) -
+                                  l2_ref(&a[0], &b[0], dim));
+    const float e_ip = std::fabs(ip_fast(&a[0], &b[0], dim) -
+                                 ip_ref(&a[0], &b[0], dim));
+    // Relative-ish tolerance: summation order differences scale with the
+    // magnitude of the accumulated value.
+    CHECK(e_l2 <= 1e-4f * (1.0f + std::fabs(l2_ref(&a[0], &b[0], dim))));
+    CHECK(e_ip <= 1e-4f * (1.0f + std::fabs(ip_ref(&a[0], &b[0], dim))));
+  }
+}
+
 TEST_CASE("l2_distance matches hand-computed values") {
   const float a[] = {0.0f, 0.0f};
   const float b[] = {3.0f, 4.0f};

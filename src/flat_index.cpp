@@ -26,9 +26,10 @@ void l2_normalize(float* v, std::size_t dim) {
 
 FlatIndex::FlatIndex(std::size_t dim, Metric metric)
     : dim_(dim),
-      // With pre-normalisation the cosine scan is a plain inner product;
-      // search() adds the constant +1 to get back to cosine distance.
-      dist_(metric == kCosine ? &inner_product_distance
+      // With pre-normalisation the cosine scan is a plain inner product
+      // (SIMD-dispatched like every other metric); search() adds the
+      // constant +1 to get back to cosine distance.
+      dist_(metric == kCosine ? resolve_distance_fn(kInnerProduct)
                               : resolve_distance_fn(metric)),
       cosine_pre_(metric == kCosine) {
   // Reserve nothing yet; the caller-driven insert pattern of the first
