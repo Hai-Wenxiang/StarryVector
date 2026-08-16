@@ -57,6 +57,21 @@ ctest --test-dir build --output-on-failure   # 单元测试
 |---|---|---|
 | `STARRY_DISABLE_SIMD` | `OFF` | 完全跳过 AVX2 内核（仅标量） |
 
+### 安装与集成
+
+安装库与头文件（默认前缀 `/usr/local`，可用 `--prefix` 覆盖；CMake 3.15 以下用 `make install`）：
+
+```bash
+cmake --install build --prefix /path/to/install
+```
+
+在其他 CMake 项目中使用（安装后通过 `find_package`，或将本仓库直接 `add_subdirectory` 后链接 `starry_core`）：
+
+```cmake
+find_package(StarryVector 0.1 REQUIRED)   # 版本兼容策略：同主版本号
+target_link_libraries(my_app PRIVATE StarryVector::starry_core)
+```
+
 ## 快速上手
 
 ```cpp

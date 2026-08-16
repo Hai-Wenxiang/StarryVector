@@ -57,6 +57,21 @@ Build options:
 |---|---|---|
 | `STARRY_DISABLE_SIMD` | `OFF` | Skip AVX2 kernels entirely (scalar only) |
 
+### Install & consume
+
+Install the library and headers (default prefix `/usr/local`, override with `--prefix`; on CMake < 3.15 use `make install`):
+
+```bash
+cmake --install build --prefix /path/to/install
+```
+
+Use from another CMake project (after install via `find_package`, or add this repository with `add_subdirectory` and link `starry_core` directly):
+
+```cmake
+find_package(StarryVector 0.1 REQUIRED)   # version policy: same major
+target_link_libraries(my_app PRIVATE StarryVector::starry_core)
+```
+
 ## Quick Start
 
 ```cpp
