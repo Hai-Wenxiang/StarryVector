@@ -1,6 +1,6 @@
 # StarryVector
 
-A high-performance **vector database for RAG (Retrieval-Augmented Generation)**, written in modern C++.
+A high-performance **vector database for RAG (Retrieval-Augmented Generation)**, written in portable **C++11** — no C++14/17/20 required, compiles on legacy toolchains (GCC 4.9+, Clang 3.5+, MSVC 2015+).
 
 StarryVector provides efficient storage, indexing, and similarity search for high-dimensional embedding vectors, designed to serve as the retrieval backbone of RAG pipelines.
 
@@ -27,7 +27,7 @@ StarryVector provides efficient storage, indexing, and similarity search for hig
 
 Requirements:
 
-- C++20 compliant compiler (GCC 11+, Clang 14+, or MSVC 19.30+)
+- C++11 compliant compiler (GCC 4.9+, Clang 3.5+, or MSVC 2015+)
 - CMake 3.20+
 
 ```bash
@@ -49,8 +49,8 @@ int main() {
     db.insert(2, {0.3f, 0.4f, /* ... */});
 
     auto results = db.search({0.1f, 0.2f, /* ... */}, /*k=*/10);
-    for (auto& [id, distance] : results) {
-        // top-k nearest neighbors
+    for (const auto& hit : results) {
+        // hit.id, hit.distance — top-k nearest neighbors
     }
 }
 ```
