@@ -69,6 +69,25 @@ class VectorDB {
   // forwards to the pointer version.
   Status insert(id_t id, const std::vector<float>& vec);
 
+  // Bulk insert of ids.size() vectors (packed row-major in `vecs`,
+  // exactly ids.size() * dim() floats; row i belongs to ids[i]).
+  //
+  // With the HNSW kind the graph is built by the deterministic parallel
+  // bulk constructor: the resulting graph depends only on (vectors, id
+  // order, seed), never on `threads` or thread scheduling - replaying
+  // the same batch sequence reproduces a bit-identical graph (see
+  // HnswIndex::add_rows_bulk).  For kFlatIndex this is simply a batched
+  // append.  `threads` = 0 selects hardware_concurrency (>= 1).
+  //
+  // Validation is atomic: a size mismatch returns kInvalidArgument and
+  // a duplicated id (inside the batch or live in the database) returns
+  // kDuplicateId with NOTHING inserted - unlike insert(), which leaves
+  // earlier rows in place when it fails midway.  Soft-deleted ids are
+  // revived exactly as with insert().
+  Status insert_bulk(const std::vector<id_t>& ids,
+                     const std::vector<float>& vecs,
+                     std::size_t threads = 0);
+
   // Soft-deletes an id: it disappears from search() and get() but the
   // bytes remain in the index buffer until compaction (future work).
   // Returns kNotFound for unknown or already deleted ids.

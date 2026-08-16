@@ -16,7 +16,14 @@
 //
 // Determinism: the level generator is a seeded mt19937, so the same
 // insert sequence always yields the identical graph (reproducible
-// builds, see notes/01 §3.3).
+// builds, see notes/01 §3.3).  add_rows_bulk() extends this guarantee
+// to parallel construction: the wave size is a fixed constant, planning
+// reads only a frozen graph prefix and linking is sequential, so the
+// resulting graph is a pure function of (data, seed, call sequence) -
+// independent of the number of worker threads and their scheduling.
+// Note the bulk-built graph is deterministic but NOT identical to the
+// row-by-row add_row() graph: within one wave, nodes link only to rows
+// that existed before the wave (recall is equivalent, see tests).
 //
 // Deletion: callers pass a skip set of ids; deleted nodes are ignored
 // during the walk.  Graph repair after deletion is future work (M5).
@@ -46,6 +53,19 @@ class HnswIndex {
   // Adds one node for base row `row` (must equal current node count,
   // i.e. rows are added densely in order 0, 1, 2, ...).
   void add_row(std::size_t row);
+
+  // Deterministic parallel bulk construction of `n` nodes for base rows
+  // [size(), size()+n); the rows must already exist in the base index
+  // (VectorDB::insert_bulk appends them first).  `threads` workers
+  // cooperate; 0 selects hardware_concurrency (clamped to >= 1).
+  //
+  // Algorithm: rows are processed in waves of a fixed compile-time size
+  // (kBulkWave).  For each wave, every node's ef_construction-bounded
+  // candidate search runs in parallel against the frozen graph prefix
+  // (rows below the wave start - read-only, lock-free); the nodes are
+  // then linked into the graph sequentially in row order.  The wave
+  // size never depends on `threads`, hence the determinism above.
+  void add_rows_bulk(std::size_t n, std::size_t threads = 0);
 
   // Approximate k-NN over rows, skipping ids in `skip` (may be null).
   // `ef` is the search-time beam width; larger = better recall, slower.
@@ -86,10 +106,17 @@ class HnswIndex {
   float row_dist(const float* query, std::size_t row) const;
   float row_row_dist(std::size_t a, std::size_t b) const;
 
+  // Draws the next node level from the seeded generator (exponential
+  // distribution, mL = 1/ln(M)).  Shared by add_row and the bulk path
+  // so both consume the generator identically.
+  std::int32_t draw_level();
+
   // Diversity heuristic (paper Alg. 4, keepPrunedConnections disabled):
   // walk candidates nearest-first, keep c only when it is closer to the
-  // base point than to every neighbour already kept.
-  void select_heuristic(const float* q, std::vector<std::int32_t>& cands,
+  // base point than to every neighbour already kept.  `cands` is only
+  // read (sorted nearest-first by the caller).
+  void select_heuristic(const float* q,
+                        const std::vector<std::int32_t>& cands,
                         std::size_t M, std::vector<std::int32_t>* out) const;
 
   // Best-first search on one layer, beam width ef.  Fills `results` with
@@ -99,6 +126,26 @@ class HnswIndex {
                     const std::unordered_set<id_t>* skip,
                     std::vector<std::pair<float, std::int32_t>>* results,
                     std::size_t layer) const;
+
+  // ---- deterministic parallel bulk construction (add_rows_bulk) ----------
+  // Per-node plan produced by the parallel phase: the level and, for
+  // every layer that exists in the frozen prefix, the candidate rows
+  // (nearest first) found by searching the frozen graph.
+  struct BulkPlan {
+    std::int32_t level = 0;
+    std::int32_t frozen_max_level = 0;  // max_level_ when planned
+    // layer -> candidate rows; sized level+1, layers above
+    // frozen_max_level stay empty (linked lists stay empty likewise).
+    std::vector<std::vector<std::int32_t>> layers;
+  };
+
+  // Read-only worker of the parallel phase: computes the plan for one
+  // row against the current (frozen) graph.  Must not mutate state.
+  void plan_row(std::size_t row, std::size_t efc, BulkPlan* plan) const;
+
+  // Sequential counterpart of add_row()'s linking half: materialises the
+  // planned node, back-links neighbours and shrinks overfull lists.
+  void link_row(std::size_t row, const BulkPlan& plan);
 
   const FlatIndex& base_;
   const std::size_t dim_;

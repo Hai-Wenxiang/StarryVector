@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <random>
 #include <string>
 #include <unordered_set>
@@ -434,5 +435,167 @@ TEST_CASE("load rejects a corrupted magic") {
   starry::Status status = starry::kOk;
   CHECK(starry::VectorDB::load(path, &status) == std::unique_ptr<starry::VectorDB>());
   CHECK(status == starry::kIoError);
+  std::remove(path);
+}
+
+// ---- insert_bulk & deterministic parallel HNSW build ------------------------
+
+namespace {
+
+// Reads a whole file into a byte string (for bit-identical graph
+// comparison; save() output is fully determined by the database state,
+// so equal files <=> equal graphs).
+std::string slurp(const char* path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+// Builds an hnsw database from `data` via insert_bulk with `threads`
+// workers and returns it; dim/rows derive from the buffer.
+std::unique_ptr<starry::VectorDB> bulk_build(const std::vector<float>& data,
+                                             std::size_t dim,
+                                             std::size_t threads) {
+  std::unique_ptr<starry::VectorDB> db(
+      new starry::VectorDB(dim, starry::kL2, starry::kHnswIndex));
+  db->set_search_ef(128);
+  std::vector<starry::id_t> ids(data.size() / dim);
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    ids[i] = static_cast<starry::id_t>(i);
+  }
+  REQUIRE(db->insert_bulk(ids, data, threads) == starry::kOk);
+  return db;
+}
+
+}  // namespace
+
+TEST_CASE("insert_bulk on flat matches row-by-row insert and validates atomically") {
+  const std::size_t dim = 16;
+  const std::size_t rows = 300;
+  const std::vector<float> data = make_random_vector(rows * dim, 5);
+  std::vector<starry::id_t> ids(rows);
+  for (std::size_t i = 0; i < rows; ++i) {
+    ids[i] = 500 + static_cast<starry::id_t>(i);  // non-trivial ids
+  }
+
+  starry::VectorDB serial(dim, starry::kL2, starry::kFlatIndex);
+  starry::VectorDB bulk(dim, starry::kL2, starry::kFlatIndex);
+  for (std::size_t i = 0; i < rows; ++i) {
+    REQUIRE(serial.insert(ids[i], &data[i * dim]) == starry::kOk);
+  }
+  REQUIRE(bulk.insert_bulk(ids, data, 0) == starry::kOk);
+  CHECK(bulk.size() == serial.size());
+  CHECK(bulk.capacity() == serial.capacity());
+
+  // Identical search behaviour (exact index => identical hits).
+  for (std::uint32_t s = 0; s < 5; ++s) {
+    const std::vector<float> query = make_random_vector(dim, 600 + s);
+    CHECK(same_hits(serial.search(query, 25), bulk.search(query, 25)));
+  }
+
+  // ---- atomic validation -------------------------------------------------
+  const std::size_t size_before = bulk.size();
+  std::vector<starry::id_t> bad_ids(ids);
+  bad_ids.push_back(ids[7]);  // duplicate inside the batch
+  CHECK(bulk.insert_bulk(bad_ids, std::vector<float>((rows + 1) * dim, 0.0f),
+                         0) == starry::kDuplicateId);
+  CHECK(bulk.insert_bulk(ids, data, 0) == starry::kDuplicateId);  // live dup
+  CHECK(bulk.insert_bulk(ids, std::vector<float>(3, 0.0f), 0) ==
+        starry::kInvalidArgument);                                // size mismatch
+  CHECK(bulk.insert_bulk(std::vector<starry::id_t>(),
+                         std::vector<float>(), 0) == starry::kOk);  // empty ok
+  CHECK(bulk.size() == size_before);  // nothing leaked in
+
+  // ---- revive semantics matches insert() ----------------------------------
+  REQUIRE(bulk.remove(ids[0]) == starry::kOk);
+  CHECK(bulk.size() == size_before - 1);
+  const std::vector<float> one(&data[0], &data[dim]);
+  REQUIRE(bulk.insert_bulk({ids[0]}, one, 0) == starry::kOk);
+  CHECK(bulk.size() == size_before);
+  std::vector<float> got;
+  CHECK(bulk.get(ids[0], &got));
+}
+
+TEST_CASE("hnsw bulk build is bit-identical across thread counts") {
+  const std::size_t dim = 16;
+  // 3000 rows = 11 full waves (256) + a partial 184-row wave: exercises
+  // both the multi-wave path and the final short wave.
+  const std::size_t rows = 3000;
+  const std::vector<float> data = make_random_vector(rows * dim, 9);
+
+  const std::size_t thread_counts[] = {1, 3, 8};
+  std::vector<std::string> files;
+  for (std::size_t t = 0; t < sizeof(thread_counts) / sizeof(thread_counts[0]);
+       ++t) {
+    std::unique_ptr<starry::VectorDB> db =
+        bulk_build(data, dim, thread_counts[t]);
+    CHECK(db->size() == rows);
+    char path[64];
+    std::snprintf(path, sizeof(path), "/tmp/starry_test_bulk_t%zu.bin",
+                  thread_counts[t]);
+    REQUIRE(db->save(path) == starry::kOk);
+    files.push_back(slurp(path));
+    std::remove(path);
+  }
+  CHECK(files[0].size() > 0);
+  CHECK(files[0] == files[1]);  // 1 vs 3 workers
+  CHECK(files[0] == files[2]);  // 1 vs 8 workers
+}
+
+TEST_CASE("hnsw bulk build recall is on par with serial and round-trips") {
+  const std::size_t dim = 16;
+  const std::size_t rows = 3000;
+  const std::size_t k = 10;
+  const std::vector<float> data = make_random_vector(rows * dim, 13);
+
+  starry::VectorDB flat(dim, starry::kL2, starry::kFlatIndex);
+  starry::VectorDB serial(dim, starry::kL2, starry::kHnswIndex);
+  serial.set_search_ef(128);
+  for (std::size_t i = 0; i < rows; ++i) {
+    REQUIRE(flat.insert(static_cast<starry::id_t>(i), &data[i * dim]) ==
+            starry::kOk);
+    REQUIRE(serial.insert(static_cast<starry::id_t>(i), &data[i * dim]) ==
+            starry::kOk);
+  }
+  std::unique_ptr<starry::VectorDB> bulk = bulk_build(data, dim, 4);
+
+  double recall_serial = 0.0;
+  double recall_bulk = 0.0;
+  const std::size_t nq = 30;
+  for (std::uint32_t q = 0; q < nq; ++q) {
+    const std::vector<float> query = make_random_vector(dim, 2000 + q);
+    const std::vector<starry::SearchResult> want = flat.search(query, k);
+    std::unordered_set<starry::id_t> want_ids;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      want_ids.insert(want[i].id);
+    }
+    double hs = 0.0, hb = 0.0;
+    const std::vector<starry::SearchResult> got_s = serial.search(query, k);
+    const std::vector<starry::SearchResult> got_b = bulk->search(query, k);
+    REQUIRE(got_b.size() == k);
+    for (std::size_t i = 0; i < k; ++i) {
+      if (want_ids.count(got_s[i].id) != 0) hs += 1.0;
+      if (want_ids.count(got_b[i].id) != 0) hb += 1.0;
+    }
+    recall_serial += hs;
+    recall_bulk += hb;
+  }
+  recall_serial /= static_cast<double>(nq * k);
+  recall_bulk /= static_cast<double>(nq * k);
+  CHECK(recall_bulk >= 0.95);
+  CHECK(std::fabs(recall_serial - recall_bulk) <= 0.02);
+
+  // The bulk-built graph survives save/load bit-identically and keeps
+  // serving the same results.
+  const char* path = "/tmp/starry_test_bulk_rt.bin";
+  REQUIRE(bulk->save(path) == starry::kOk);
+  starry::Status status = starry::kOk;
+  std::unique_ptr<starry::VectorDB> loaded = starry::VectorDB::load(path, &status);
+  REQUIRE(loaded);
+  CHECK(status == starry::kOk);
+  CHECK(loaded->kind() == starry::kHnswIndex);
+  loaded->set_search_ef(128);
+  const std::vector<float> query = make_random_vector(dim, 3000);
+  CHECK(same_hits(bulk->search(query, 50), loaded->search(query, 50)));
   std::remove(path);
 }
